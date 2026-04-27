@@ -1,0 +1,226 @@
+# Handoff for next session — 2026-04-26 v2 ship
+
+Skill at `~/.claude/skills/hubspot-demo-prep/`. Production builder is `builder.py` (1896 lines). Playwright phases in `playwright_phases.py` (1013 lines) + `playwright_phases_extras.py` (711 lines). State below reflects v2 multi-agent build session.
+
+---
+
+## What landed in v2 ✅
+
+### Doc generator (locked per Jeremy)
+- `/tmp/demo-prep-shipperzinc/make-doc.py` produces a polished 2-page demo runbook (.docx + Drive auto-converted to GDoc).
+- **Page 1 = print-ready demo runbook**: Shipperz banner header, intro paragraph (rep input + what was built), 3-item agenda each with `[BUILT]`/`[BUILD LIVE]`/`[NOT BUILT]`/`[ANALOG]` status pills + direct HubSpot links, ★ Easter Egg (lead scoring), Also Built section (5 deals individually linked, 8 contacts, custom object, events, tickets, company), Recommendation paragraph.
+- **Page 2 = supporting docs**: Pre-demo checklist, Shipperz snapshot, ICP + pain-point research, Full build inventory, Known build limitations, Sources.
+- Live at: https://docs.google.com/document/d/1dInOgWLKFXdOT-u3BzsxiRBMcQXK3AvxC57P7D73B2A/edit
+- Drive folder: 1SzHT9uhFUUcFIAh5z2LVCAq2Wt0OADjY (anyone-with-link)
+
+### Marketing email v2
+- Live at: https://app.hubspot.com/email/51393541/edit/211744773523/edit/content
+- Includes Shipperz banner header (logo on dark navy), AI-generated BMW hero image, orange `#FF6B35` brand color throughout (headline, numbered list, CTA), navy footer with Shipperz contact info.
+- HTML pushed via PATCH /marketing/v3/emails. File at `/tmp/demo-prep-shipperzinc/marketing-email-v2.html`.
+
+### v2 API phases added to `Builder` class
+1. **`create_leads()`** — 8 leads in Sales Workspace queue (object 0-136). ~72 lines.
+2. **`create_quotes()`** — 5 quotes per deal × 3 line items each, with branded quote template association. ~116 lines. Requires pinned `HUBSPOT_DEMOPREP_{SLUG}_QUOTE_TEMPLATE_ID` env var (created by Playwright phase).
+3. **`create_invoices()`** — 2 invoices via batch endpoint (one paid backdated 30d, one open current). ~90 lines.
+4. **`create_calc_property_and_group()`** — `deal_age_days` calc property + "Shipperz Demo" property group, regroups existing demo properties. ~54 lines.
+5. **`create_marketing_campaign()`** — POST /marketing/v3/campaigns + PUT to associate marketing email + NPS form + contact list. ~69 lines. Defensive: 403 fallback to manual_step (campaigns scope enforced 2026-07-09).
+
+### Playwright UI phases (no public API for these)
+File: `playwright_phases.py` exposes:
+- `upload_portal_branding(...)` — Settings → Branding, upload customer logo + set primary color
+- `create_workflow(..., workflow_type="lead_nurture" or "nps_routing")` — Workflows → Create
+- `create_quote_template(...)` — Sales → Quotes → Templates → Create with logo + brand colors
+- `create_sales_sequence(...)` — Automation → Sequences → Create
+- `kick_off_seo_scan(...)` — Marketing → SEO → New topic → Get audit. **Note: SEO scan takes hours on HubSpot side. Doc surfaces the URL and timestamp; rep checks before demo.**
+- Plus orchestrator `run_all_phases(...)` and context manager `PlaywrightSession` (storage-state per slug at `state/{slug}-hubspot.json`).
+
+File: `playwright_phases_extras.py` exposes:
+- `create_starter_dashboard(...)` — "Shipperz Daily Snapshot" with 4-6 cards (pipeline, tickets, contacts, email opens, NPS, custom event fires)
+- `create_saved_views(...)` — 3 views (Hot Leads contacts, Open Quotes deals, Tickets Needs Reply)
+
+Wired into `Builder.run_playwright_phases(first_run=False)` at line ~1696. CLI: `python3 builder.py {slug} --playwright [--first-run]`.
+
+**ALL Playwright selectors are GUESSED** (text/role-based, not CSS). The `_safe_flow` wrapper catches all failures, screenshots on success/failure, falls back to `manual_step` rather than crashing.
+
+### Codex doc fixes applied
+1. Drive file title: `HubSpot Demo Prep · Shipperz Inc` (was em-dashed).
+2. `[NOT BUILT]` now uses `NOT_BUILT_RED` (#B91C1C) — visually distinct from `[BUILD LIVE]` amber.
+3. Recommendation says "no-marketing-team setup" (was "1-marketer team", contradicted intro).
+
+### Setup wizard fixes
+- `helpers/00-wizard.sh` line 117: grep pattern was `'^- \``' which never matched the inline scope format → patched to anchor on "paste this list into the search box". v1 wizard had silently emitted zero scopes since v1 ship.
+- `references/setup-procedure.md`: scopes added — `crm.objects.leads.read/write`, `crm.objects.invoices.read/write`, `marketing.campaigns.read/write`, `analytics.behavioral_events.send`. Quotes + line_items scopes were already present.
+- Playwright setup section appended to `setup-procedure.md` (pip install, first-run flow, storage-state location).
+
+---
+
+## Opus + Codex review findings (2026-04-26 reviews)
+
+### Opus blockers (3 highest-leverage fixes for shipping confidence)
+1. **Pre-flight scope check** at builder startup. Verify `marketing.campaigns.write`, `analytics.behavioral_events.send`, `automation.sequences.enrollments.write` are on the token; fail fast with "re-auth your private app" message rather than silently degrading. ~30 line addition.
+2. **Replace workflow API attempts with template-clone.** v4 flows actionTypeId `0-5` is wrong (should be `0-2` for Set Property). HANDOFF already identifies path: GET an existing UI-built workflow, save body shape as `references/workflow-template.json`, mutate per customer.
+3. **Move docx-to-Drive upload into `builder.py:generate_doc()`.** Currently doc generation stops at `.docx` on disk; rep has to manually MCP-upload. The 30-min "rep gets stuck" cliff. Solution: port `/tmp/demo-prep-shipperzinc/{make-doc,update-doc,export-pdf}.py` into a new `~/.claude/skills/hubspot-demo-prep/doc_generator.py` module, replace builder.py's HTML-based `generate_doc()` (lines ~1476-1651, now dead code).
+
+### Opus deferrals (cut for tighter ship)
+- Dashboard + saved views (`playwright_phases_extras.py`, 711 lines) — selectors fully guessed against shipping HubSpot UI; cards are generic, not Shipperz-specific. Opus says cut.
+- SEO scan kickoff — async, may still be "scanning" mid-demo.
+- Quotes + invoices + calc properties + marketing campaign tagging — built but not surfaced in agenda doc; invisible value unless agenda references them.
+- **Counterpoint:** Jeremy explicitly asked for these. Pull only with his approval.
+
+### Other Opus risks flagged (not yet addressed)
+- `builder.py:create_contacts` rewrites `.test` → `.example.com` with `demo-{slug}.` prefix (✅ FIXED in this session per RFC 2606).
+- `playwright_phases_extras.py` had `import re` at file bottom — risky for cold imports (✅ FIXED, moved to top).
+- `_state_path` was keyed per-slug, forcing redundant logins per prospect on the same sandbox (✅ FIXED, now keyed per portal_id with legacy migration).
+- HTML-based `Builder.generate_doc()` (lines ~1476-1651) is now dead code — should be deleted in next session.
+- Marketing email is in DRAFT state — rep clicking link mid-demo lands on editor, not preview. Surface preview URL specifically.
+
+### Codex findings on this v2 codebase
+(Pending — Codex review still running as of session end. Output at `/private/tmp/claude-501/-Users-jeremysagaille-Documents/.../tasks/a82053d08362598d4.output` and `afac439972c0ff35d.output`. Read on next session resume.)
+
+---
+
+## Known issues / caveats
+
+1. **Playwright selectors are guessed.** First real run on a live portal will need selector updates. Risk areas flagged in `setup-procedure.md`:
+   - Branding: "Upload logo" vs "Replace logo" vs "Edit logo"
+   - Workflows: heavy React canvas, may need workflow-builder-specific patterns
+   - Quote template: "Modern"/"Classic" template tile names
+   - Sales sequence: rich-text editor (Draft.js / contenteditable) selectors fragile
+   - SEO scan: tier-dependent label ("Add topic" varies by Marketing Hub tier)
+
+2. **Marketing Campaigns scope** `marketing.campaigns.write` is enforced 2026-07-09. Builder defensively falls back to manual_step on 403. Add to wizard scope list — done.
+
+3. **Quote template chicken-and-egg.** `create_quotes()` needs an existing template ID. Solution: `create_quote_template()` Playwright phase runs FIRST, saves ID to env, then `create_quotes()` reads it. If Playwright fails, quotes phase logs manual_step.
+
+4. **Sequence enrollments** — Jeremy explicitly said don't bother. Skipped.
+
+5. **Sales rep email templates, snippets, playbooks, KB articles, account-level branding settings, dashboards, reports, meeting links** — confirmed NO public API. Some now Playwright-automated (workflows, branding, quote template, sequence, dashboard, saved views, SEO scan). Others deferred (snippets, playbooks, KB).
+
+6. **End-to-end live test not yet run.** v2 code is parsed/imported clean but the live API + Playwright flows weren't exercised against the sandbox in this session (would require interactive first-run login). Next session: clean up existing Shipperz data and re-run end-to-end with `--first-run --playwright` to validate.
+
+---
+
+## Runtime estimate (when end-to-end is run)
+
+Best case (well-cached, fully parallel): ~5 min  
+Typical: ~7-9 min  
+First-run-per-portal (interactive auth): +30-60s once  
+With one Playwright retry: ~12-15 min
+
+---
+
+## Top files
+
+- `builder.py` (1896 lines, all phases)
+- `playwright_phases.py` (1013 lines)
+- `playwright_phases_extras.py` (711 lines)
+- `references/v2-capabilities.md` (research, top-5 quick wins ranked)
+- `references/v2-content-campaigns.md` (Marketing Campaigns recipe)
+- `references/setup-procedure.md` (scopes + Playwright setup)
+- `helpers/00-wizard.sh` (with the v1 grep bug fixed)
+- `/tmp/demo-prep-shipperzinc/make-doc.py` (doc generator — should be ported into builder.py.generate_doc() in next session)
+
+## Final asset URLs
+
+- **Demo Doc (final):** https://docs.google.com/document/d/1dInOgWLKFXdOT-u3BzsxiRBMcQXK3AvxC57P7D73B2A/edit
+- **Drive folder:** https://drive.google.com/drive/folders/1SzHT9uhFUUcFIAh5z2LVCAq2Wt0OADjY
+- **Marketing email (live):** https://app.hubspot.com/email/51393541/edit/211744773523/edit/content
+- **Sandbox:** https://app.hubspot.com/contacts/51393541
+- **Sample contact:** https://app.hubspot.com/contacts/51393541/record/0-1/218011238955
+- **Pipeline (board):** https://app.hubspot.com/contacts/51393541/objects/0-3/views/all/board?pipeline=893842217
+- **Custom object (Shipments):** https://app.hubspot.com/contacts/51393541/objects/2-61481665
+- **NPS form:** https://app.hubspot.com/forms/51393541/editor/866a9eb0-c553-49c6-9374-431e82d71b5e/edit/form
+
+## Paste-ready prompt for next session
+
+```
+Resuming hubspot-demo-prep skill. Read ~/.claude/skills/hubspot-demo-prep/HANDOFF.md.
+
+Top priorities:
+1. End-to-end live test on a fresh customer slug. Cleanup shipperzinc first, then run python3 builder.py {newslug} --playwright --first-run. Validate selectors, fix breakages, screenshot every output.
+2. Port /tmp/demo-prep-shipperzinc/make-doc.py into builder.py.generate_doc() (parameterized — read from manifest, not hardcoded Shipperz IDs).
+3. Address findings from Codex + Opus reviews stored at /private/tmp/claude-501/.../tasks/{ids}.output (run timestamp 2026-04-26).
+4. Build CRM card UI extension via `hs project create + crm-card` for the Shipments object (deferred from v2).
+
+Sandbox: 51393541. Token + PAK in ~/.claude/api-keys.env. Drive folder: 1SzHT9uhFUUcFIAh5z2LVCAq2Wt0OADjY.
+```
+
+---
+
+## v3 session — 2026-04-26 evening
+
+### Code changes that landed this session
+
+1. **Pre-flight scope check** added at builder startup. `Builder.preflight_scopes()` (~55 lines) hits `POST /oauth/v2/private-apps/get/access-token-info` with `tokenKey` body, parses scopes, hard-fails with re-auth deep link if any of `REQUIRED_SCOPES` (defined module-level) is missing. Optional scopes surface as warnings without blocking. Wired as first call in `Builder.run()`.
+
+2. **Private App scopes unlocked via Playwright** (Claude_in_Chrome MCP against the user's logged-in Chrome). Token now has 39 scopes — added `marketing.campaigns.read/write`, `crm.objects.leads.read/write`, `crm.objects.invoices.read/write`, `crm.schemas.deals.read/write`. Re-auth deep link: `https://app.hubspot.com/private-apps/51393541/37767254`. The existing token kept the same value but gained scopes — no env file change needed.
+
+3. **Engagement cleanup tagging** (priority 6). `ensure_properties()` extended to create `demo_customer` on engagement object types (notes/tasks/calls/meetings/emails) with a 400 retry-without-groupName fallback. `create_engagements()` adds `demo_customer: <slug>` to every engagement payload's `properties` dict.
+
+4. **Custom-object + calc-property cleanup** (priority 7). `cleanup()` now reads manifest's `custom_object.object_type_id`, paginates GET to delete every record, then DELETE on the schema (with 405→`/purge` fallback). Also DELETEs the calc property `deal_age_days` and the property group from manifest's `calc_property` field.
+
+5. **Doc generator port** (priority 3) — subagent ported `/tmp/demo-prep-shipperzinc/{make-doc,update-doc,export-pdf}.py` into new `~/.claude/skills/hubspot-demo-prep/doc_generator.py` (~700 lines). Public API:
+   - `generate_docx(manifest, research, plan, *, slug, work_dir, portal) -> docx_path`
+   - `upload_to_drive(docx_path, *, doc_title, drive_folder_id, replace_doc_id=None) -> dict`
+   - `export_pdf(doc_id, out_path) -> str | None`
+   - Defaults to creating a NEW GDoc (locked Shipperz doc only overwritten when `slug == "shipperzinc"` AND env `HUBSPOT_DEMOPREP_LOCKED_DOC_ID` is set, which it isn't).
+   - rclone-based OAuth refresh; on failure, saves .docx locally and returns `gdoc_url: None` (build keeps going).
+   - Heuristic agenda status pills derived from manifest signals (forms/workflows/email present + agenda title keyword match).
+   - **Builder.generate_doc()** now a 24-line delegate. ~150 lines of dead HTML-based code deleted.
+
+6. **Workflow API restored with actionTypeId fix** (priority 5). After Jeremy pushed back, restored the v4 flows API call. Set Property action: `0-5` → `0-2`. API still returned 500 internal error on live test — `0-2` is also wrong. Playwright phase is the actual fallback. Kept gap-action manual_step logging for steps the API can't express.
+
+7. **Slash command `/hotdog`** at `~/.claude/commands/hotdog.md`. Invokes the skill with a banner. Banner script at `~/.claude/skills/hubspot-demo-prep/helpers/banner.sh` uses bash ANSI-C `$'\e[...m'` quoting so heredoc preserves real escape characters. (Jeremy iterating the banner himself in another session.)
+
+### Live test (2026-04-26 ~20:20)
+
+**Cleanup** (`python3 builder.py cleanup shipperzinc`): worked. Custom-object schema teardown succeeded (priority 7 validated). 400s on invoices/quotes/leads/engagements searches because those properties didn't exist on those object types yet (build had never finished v2). Expected.
+
+**API-only build** (`python3 builder.py shipperzinc`, no Playwright, ~95 sec, exit 0):
+
+Worked: company (54459406956), 8 contacts, pipeline (reused 893842217), 5 deals, 2 tickets, **168 engagements** (now tagged with demo_customer), custom object schema (2-61503444) + 4 records, 1 custom event def + 15 fires, lead scores 8/8, marketing email (211757175353) with AI hero image, marketing campaign (c00f917c-ae80-4332-a80d-dd4b5860f240) + 2 assets linked, property group `shipperz_demo_properties`, demo doc generated locally.
+
+Failed: **leads 0/8** (silent — create_leads swallows error), **Quote form** 400 VALIDATION_ERROR, **form submissions 0/6**, **both workflows** 500 internal error (actionTypeId 0-2 also wrong), **all 5 quotes** 400, **invoices** 400 batch, **calc property** 400 (`Unable to parse calculation formula… DAYS_BETWEEN(createdate, NOW())` — formula syntax wrong; HubSpot wants `(NOW() - createdate)` style). Drive upload 403 quota — non-blocking, .docx saved at `/tmp/demo-prep-shipperzinc/demo-doc.docx`.
+
+19 errors, 6 manual steps. Build summary at end of `/tmp/demo-prep-shipperzinc/build-api-run-1.log`.
+
+**Playwright phase: NOT RUN** — pending Jeremy's go-ahead at session end.
+
+### Bugs to fix (next session)
+
+1. **`create_leads()` swallows errors.** Prints `✓ leads: 0/8` (green) when 0 created. Need to log per-lead error responses to identify the actual API failure.
+2. **Workflow v4 API actionTypeId for Set Property still wrong.** `0-2` returned 500. Either probe HubSpot's exposed action types via `GET /automation/v4/actionTypes` (if endpoint exists), OR commit to template-clone (clone an existing UI-built workflow's body shape). For Friday, Playwright UI fallback is the realistic path.
+3. **Calc property formula syntax wrong.** `DAYS_BETWEEN(createdate, NOW())` rejected — needs HubSpot's actual calc-prop function set. The error message lists allowed operators; rewrite formula accordingly.
+4. **Quote create 400** on all 5. Likely missing required field or wrong association ID. Need to log the response body.
+5. **Quote form 400 internal error** — VALIDATION_ERROR on form body shape.
+
+### New backlog item from Jeremy
+
+**End-of-build verification loop** — after every phase that creates an artifact, re-fetch via API GET, confirm key fields populated, optionally Playwright-screenshot the rendered UI. If verification fails, mark the doc's status pill as `[NOT_BUILT]` instead of `[BUILT]`. Also add a "happy path walkthrough" that screenshots 3-5 demo URLs (one contact, pipeline board, email preview, NPS form) and saves to `<work_dir>/verification/`. This addresses the "we say it's built but it's not viewable" gap.
+
+### Next-session priorities
+
+1. **Run Playwright phase** (`python3 builder.py shipperzinc --playwright --first-run`) — handles workflows + branding + saved views via UI. Highest demo-value item still missing.
+2. Fix the 5 v2 bugs above (leads error logging, calc formula, quote payload, quote form, workflow API or template-clone).
+3. Build the verification loop (Jeremy's testing-loop request).
+4. Wrap as Claude Code plugin (`.claude-plugin/plugin.json` + `marketing.json` + `git init`) for distribution.
+
+### Paste-ready re-prompt
+
+```
+Resuming hubspot-demo-prep skill. Read ~/.claude/skills/hubspot-demo-prep/HANDOFF.md
+(skip to "v3 session — 2026-04-26 evening" — that's the latest state).
+
+Token has 39 scopes; pre-flight check passes. Cleanup is sound, custom-object teardown works,
+engagements now tagged with demo_customer at creation.
+
+Today's outstanding work:
+1. Run python3 builder.py shipperzinc --playwright --first-run — Playwright UI phases never ran.
+   Watch selector breakages, screenshot every flow.
+2. Fix 5 bugs from API run (see HANDOFF "Bugs to fix" section): leads error logging,
+   calc property formula, quote 400, quote form 400, workflow API.
+3. Build verification loop per Jeremy's request — phase-end API GET + optional screenshot.
+4. Banner is being iterated by Jeremy directly — don't touch helpers/banner.sh.
+
+Sandbox 51393541. Last build manifest: /tmp/demo-prep-shipperzinc/manifest.json.
+```
