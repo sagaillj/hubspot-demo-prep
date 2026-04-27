@@ -117,11 +117,11 @@ ASSOC = {
     # v2 additions
     "lead_to_contact": 578,
     "quote_to_deal": 64,
-    "quote_to_contact": 71,
+    "quote_to_contact": 69,        # was 71 — 71 is a company-side type, caused INVALID_FROM_OBJECT
     "quote_to_line_item": 67,
     "quote_to_template": 286,
     "invoice_to_contact": 177,
-    "invoice_to_line_item": 181,
+    "invoice_to_line_item": 409,   # was 181 — 181 is a company-side type, caused INVALID_FROM_OBJECT
 }
 
 # HubSpot rate limits per tier (Enterprise = 190 req / 10s)
@@ -770,6 +770,21 @@ class Builder:
         if not self.plan.get("forms"):
             return
         log("Phase 8: Forms")
+        # HubSpot's Forms v3 API rejects forms where a default contact property
+        # is mapped with the wrong field type. The plan often declares phone/email
+        # as "single_line_text"; HubSpot requires the type to match the underlying
+        # property (phone = "phone", email = "email"). Auto-correct here.
+        DEFAULT_CONTACT_FIELD_TYPES = {
+            "email": "email",
+            "phone": "phone",
+            "mobilephone": "phone",
+            "fax": "phone",
+            "website": "single_line_text",
+            "firstname": "single_line_text",
+            "lastname": "single_line_text",
+            "company": "single_line_text",
+            "jobtitle": "single_line_text",
+        }
         for fp in self.plan["forms"]:
             # Find existing by listing all (HubSpot list endpoint doesn't filter by name)
             existing_guid = None
@@ -786,7 +801,9 @@ class Builder:
                 # Split fields into groups of max 3 (HubSpot constraint)
                 all_fields = [{"objectTypeId": "0-1", "name": fld["name"],
                               "label": fld["label"], "required": fld.get("required", False),
-                              "hidden": False, "fieldType": fld.get("field_type", "single_line_text")}
+                              "hidden": False,
+                              "fieldType": DEFAULT_CONTACT_FIELD_TYPES.get(
+                                  fld["name"], fld.get("field_type", "single_line_text"))}
                              for fld in fp["fields"]]
                 groups = [{"groupType": "default_group", "richTextType": "text",
                            "fields": all_fields[i:i+3]} for i in range(0, len(all_fields), 3)]
@@ -1191,15 +1208,19 @@ class Builder:
             return
         log("Phase 12: Sales Workspace leads (0-136)")
 
-        # Pre-flight: ensure demo_customer property exists on the leads object
+        # Pre-flight: ensure demo_customer property exists on the leads object.
+        # The Properties endpoint takes the friendly name "leads", not the type id "0-136".
         prop_body = {
             "name": "demo_customer", "label": "Demo Customer Slug",
             "type": "string", "fieldType": "text", "groupName": "leadinformation",
             "description": "Tags demo data created by hubspot-demo-prep skill.",
         }
-        s, _ = self.client.request("POST", "/crm/v3/properties/0-136", prop_body)
-        if s in (403, 404):
-            warn(f"leads object not available (status {s}) — skipping phase")
+        skip_demo_customer = False
+        s, r = self.client.request("POST", "/crm/v3/properties/leads", prop_body)
+        if s == 409:
+            pass  # already exists — fine
+        elif s == 404:
+            warn("leads object not available (404) — Sales Hub Pro+ required, skipping phase")
             self.add_manual_step(
                 "Sales Workspace leads",
                 f"https://app.hubspot.com/sales-workspace/{self.portal}",
@@ -1207,7 +1228,21 @@ class Builder:
                 "Sales Hub Pro+ required for Leads object",
             )
             return
-        # 409 = already exists; other errors are non-fatal here
+        elif s == 403:
+            warn("leads property pre-flight 403 — likely missing crm.schemas.leads.write scope on the private app token")
+            self.add_error("lead.property.preflight", s, r)
+            skip_demo_customer = True
+        elif not self.client.is_ok(s):
+            # Try once more without groupName (some portals don't have leadinformation group).
+            warn(f"leads property pre-flight {s}; retrying without groupName")
+            fallback = {k: v for k, v in prop_body.items() if k != "groupName"}
+            s2, r2 = self.client.request("POST", "/crm/v3/properties/leads", fallback)
+            if s2 == 409 or self.client.is_ok(s2):
+                ok("leads demo_customer property created (default group)")
+            else:
+                warn(f"leads property fallback also failed: {s2} {str(r2)[:200]}")
+                self.add_error("lead.property.preflight", s2, r2)
+                skip_demo_customer = True
 
         labels = ["WARM", "HOT", "COLD"]
         sources = ["Web form", "Inbound call", "LinkedIn outreach",
@@ -1221,12 +1256,14 @@ class Builder:
             for email, cid in contact_items:
                 name_prefix = email.split("@")[0].replace(".", " ").title()
                 src = random.choice(sources)
+                props = {
+                    "hs_lead_name": f"{name_prefix} — auto transport inquiry ({src})",
+                    "hs_lead_label": random.choice(labels),
+                }
+                if not skip_demo_customer:
+                    props["demo_customer"] = self.slug
                 body = {
-                    "properties": {
-                        "hs_lead_name": f"{name_prefix} — auto transport inquiry ({src})",
-                        "hs_lead_label": random.choice(labels),
-                        "demo_customer": self.slug,
-                    },
+                    "properties": props,
                     "associations": [{
                         "to": {"id": cid},
                         "types": [{"associationCategory": "HUBSPOT_DEFINED",
@@ -1472,9 +1509,11 @@ class Builder:
     # ---- Phase 15: Calculation property + property group ----
 
     def create_calc_property_and_group(self) -> None:
-        """Create 'Shipperz Demo Properties' group on deals, add deal_age_days
-        calculation property, and re-group existing demo properties under it."""
-        log("Phase 15: Calc property + property group")
+        """Create the demo property group on deals, register `deal_age_days` as
+        a plain number property (not a calculated one — HubSpot's
+        calculation_equation grammar has no NOW() function and time-since via
+        API is poorly documented), then backfill realistic per-deal values."""
+        log("Phase 15: Property group + deal_age_days backfill")
         group_name = "shipperz_demo_properties"
         group_label = "Shipperz Demo"
 
@@ -1489,31 +1528,37 @@ class Builder:
             warn(f"property group: {s}")
             self.add_error("property_group.create", s, r)
 
-        # 2) Calculation property: deal_age_days
-        calc_body = {
+        # 2) Static number property: deal_age_days. Populated per-deal below.
+        prop_body = {
             "name": "deal_age_days",
             "label": "Deal Age (days)",
             "type": "number",
-            "fieldType": "calculation_equation",
+            "fieldType": "number",
             "groupName": group_name,
-            "calculationFormula": "DAYS_BETWEEN(createdate, NOW())",
-            "description": "Days since the deal was created (auto-calculated).",
+            "description": "Days since the deal was created (demo-populated; not a live calc).",
         }
-        s, r = self.client.request("POST", "/crm/v3/properties/deals", calc_body)
+        s, r = self.client.request("POST", "/crm/v3/properties/deals", prop_body)
         if self.client.is_ok(s) or s == 409:
             self.manifest["calc_property"] = {
                 "name": "deal_age_days", "group": group_name,
             }
-            ok(f"calc property deal_age_days → {group_name}")
+            ok(f"deal_age_days property → {group_name}")
         else:
-            warn(f"calc property: {s} {str(r)[:200]}")
+            warn(f"deal_age_days property: {s} {str(r)[:200]}")
             self.add_error("calc_property.create", s, r)
-            self.add_manual_step(
-                "Calc property: Deal Age (days)",
-                self.url("property-settings", self.portal, "properties"),
-                "Add deal_age_days property manually with formula DAYS_BETWEEN(createdate, NOW()).",
-                f"API returned {s}",
-            )
+
+        # 3) Backfill: each deal gets a plausible age (0-90 days).
+        deal_ids = list(self.manifest.get("deals", {}).values())
+        if deal_ids:
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                futures = []
+                for did in deal_ids:
+                    age = random.randint(2, 90)
+                    futures.append(ex.submit(
+                        self.client.request, "PATCH", f"/crm/v3/objects/deals/{did}",
+                        {"properties": {"deal_age_days": str(age)}}))
+                ok_count = sum(1 for f in as_completed(futures) if self.client.is_ok(f.result()[0]))
+            ok(f"deal_age_days backfilled: {ok_count}/{len(deal_ids)}")
 
         # 3) Re-group existing demo property on deals
         for prop_name in ("demo_customer",):
