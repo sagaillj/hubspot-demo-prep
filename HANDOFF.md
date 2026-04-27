@@ -400,3 +400,132 @@ which is the right pill: rep walks that step live.
 - Plugin wrap (`.claude-plugin/plugin.json` + marketplace.json + GitHub
   push) deferred per Jeremy.
 
+---
+
+## v5 / v0.2.0 plugin release — 2026-04-26 night
+
+### Released
+
+- **Plugin shipped to GitHub:** https://github.com/sagaillj/hubspot-demo-prep
+  Marketplace name `hubspot-demo-prep`, plugin name `hubspot-demo-prep`,
+  versions `0.1.0` (initial plugin wrap) and `0.2.0` (post-test fixes).
+- **Installed in Jeremy's local Claude Code:**
+  `claude plugin marketplace add sagaillj/hubspot-demo-prep`,
+  `claude plugin install hubspot-demo-prep@hubspot-demo-prep`,
+  later `claude plugin update hubspot-demo-prep@hubspot-demo-prep` to 0.2.0.
+  After plugin update, Claude says "Restart to apply changes" — restart
+  required for new manifest to load.
+- **Repo restructured for plugin layout:**
+  - `.claude-plugin/{plugin,marketplace}.json` at root
+  - `commands/hotdog.md` at root (uses `${CLAUDE_PLUGIN_ROOT}` for paths)
+  - `skills/hubspot-demo-prep/` holds all the prior skill files
+  - `state/` removed from repo; STATE_DIR moved to
+    `~/.claude/data/hubspot-demo-prep/state/` (portable, survives plugin
+    reinstalls). Existing `portal-51393541-hubspot.json` migrated.
+- **Old user-level `~/.claude/commands/hotdog.md` backed up to `.bak`**
+  to prevent shadowing of the plugin's slash command.
+
+### v0.2.0 fixes (post-test on Boomer McLOUD)
+
+1. **Doc regression fixed.** SKILL.md Phase 3+4 was still describing
+   the old shell-helper architecture (`bash helpers/02-seed-crm.sh`
+   etc.) that no longer matches the implementation. The orchestrator
+   in another session interpreted "Generate a Google Doc" as
+   "you write markdown via the Drive MCP" — produced a markdown source
+   file instead of the formatted .docx. Both SKILL.md and
+   commands/hotdog.md now explicitly say "run
+   `python3 ${CLAUDE_PLUGIN_ROOT}/skills/hubspot-demo-prep/builder.py
+   <slug>`" and have a CRITICAL section warning against the regression
+   pattern.
+
+2. **Research script parallelized.** `helpers/01-research.sh` was
+   running Firecrawl, Playwright screenshot, and Perplexity
+   sequentially. Now they launch as parallel background jobs; script
+   waits on each PID. Saves 1-3 min per fresh run.
+
+3. **Research cache (24h TTL).** Same script now exits early with
+   "Using cached research" if `research.json` exists for the slug
+   and is younger than 86400s. `--no-cache` flag forces re-fetch.
+   Saves 2-5 min on re-runs.
+
+4. **Playwright opt-in confirmed.** Already opt-in via `--playwright`
+   flag (default off). Saves 3-7 min by default.
+
+### Known regression after the Boomer McLOUD test (v0.2.0 doesn't fix these)
+
+Captured as a punch list at `skills/hubspot-demo-prep/docs/punch-lists/2026-04-26-post-test-tweaks/punch-list.md`.
+Items 1-6 deferred to next session:
+
+1. **Image-gen provider chooser** — auto-generate marketing-email hero
+   per prospect. Detect available providers in priority order (Recraft
+   free tier as default, Google Gemini if AI Studio key, OpenAI
+   gpt-image-1 if `OPENAI_API_KEY`, Codex/ChatGPT environment).
+   Surfaced via one-line preflight: "Using Recraft (free tier). Want to
+   switch?" Recraft confirmed to have a 30-credits/day free tier.
+2. **NPS form quality** — current form is just `email + firstname +
+   "Submit feedback"`. Needs the actual NPS question
+   ("On a scale of 1 to 10, would you recommend {company}?"), an
+   open-ended "Tell us about your experience", plus prospect logo + brand
+   styling.
+3. **Workflow link points to specific built workflow** — currently the
+   doc's workflow link goes to the workflows index page. Should open
+   the specific workflow's edit screen when one was built.
+4. **Quote form re-verify** — Boomer doc said "form rejected by HubSpot
+   Forms API" but v4 commit 9ce1cb8 added the validation field fix.
+   Either the new run didn't pick up the fix or there's a second
+   rejection path. Investigate.
+5. **Engagement content uniqueness** — all notes/calls/meetings look
+   copy-pasted. Each engagement should have unique content tied to deal,
+   contact, or context.
+6. **Marcus Chen contact link broken** — first contact's URL from doc
+   broken. Verification step missed it (verifies first contact via API
+   GET, not the doc's URL format).
+
+### Demo strategy decided
+
+Jeremy will kick off `/hotdog <prospect>` at the start of the LinkedIn
+recording, then spend 5-10 min talking through the architecture +
+HubSpot pain-point philosophy while the build runs in background, then
+reveal the doc + click through HubSpot artifacts. Friday recording.
+
+### Paste-ready re-prompt for next session
+
+```
+Resuming hubspot-demo-prep. v0.2.0 plugin is installed locally
+(claude plugin list shows hubspot-demo-prep@hubspot-demo-prep 0.2.0).
+Repo at https://github.com/sagaillj/hubspot-demo-prep, dev tree at
+~/.claude/skills/hubspot-demo-prep.
+
+Read ~/.claude/skills/hubspot-demo-prep/HANDOFF.md "v5 / v0.2.0" section.
+
+Active punch list at
+~/.claude/skills/hubspot-demo-prep/skills/hubspot-demo-prep/docs/punch-lists/2026-04-26-post-test-tweaks/punch-list.md.
+
+Items 7 + 8 shipped in v0.2.0. Items 1-6 are deferred and need to be
+worked next:
+  1. Image-gen provider chooser (Recraft default + Gemini/OpenAI/Codex
+     fallbacks; free tier preferred).
+  2. NPS form quality (real NPS questions + branding/logo).
+  3. Workflow link should point to the specific built workflow.
+  4. Quote form 400 re-verify after v4 fix.
+  5. Engagement content uniqueness.
+  6. Marcus Chen contact link broken; verification gap.
+
+Suggested order: 4 (small, blocks #2 indirectly), 6 + verification fix
+(small, trust issue), 2 (medium, demo-quality), 5 (medium, demo-quality),
+3 (small, but only useful once #1 / Playwright works), 1 (largest, new
+external integration). Bump to v0.3.0 when shipping.
+
+Demo recording is Friday. /hotdog will be invoked live during the
+recording, so all 6 items materially affect what the audience sees.
+
+Sandbox: 51393541. Last manifests:
+/tmp/demo-prep-shipperzinc/manifest.json,
+/tmp/demo-prep-boomermcloud/manifest.json (if it exists).
+HubSpot login state cached at
+~/.claude/data/hubspot-demo-prep/state/portal-51393541-hubspot.json.
+
+To resume the dod punch list: invoke `/dod` and it picks up the active
+list automatically.
+```
+
