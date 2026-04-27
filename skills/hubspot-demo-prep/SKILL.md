@@ -81,49 +81,45 @@ Outputs to `/tmp/demo-prep-<slug>/research.json`:
    - Conditional (only if relevant to agenda or Easter egg): custom object, custom event, marketing email, landing page, NPS form, lead scoring, additional workflows.
    - Quotes / invoices: only if explicitly relevant.
 
-### Phase 3: Build (parallel where dependencies allow)
+### Phase 3: Build + Output (single Python command, runs all 17 sub-phases incl. demo doc)
 
-Sequential by dependency (pipelines before deals, schemas before custom records, etc.); within each layer, batch where possible.
+**Critical:** all build phases AND the formatted demo doc are produced by a single Python entry point: `builder.py`. Do NOT generate the demo doc yourself with the Drive MCP — `builder.py` calls `doc_generator.py` which produces a properly formatted .docx (banner, agenda status pills, links, branding) and uploads it to Drive. A markdown-only doc is a regression.
 
-```bash
-SLUG=<customer-slug>  # e.g., shipperzinc
-
-bash helpers/02-seed-crm.sh "$SLUG"        # company, contacts, pipelines, deals, tickets
-bash helpers/03-engagements.sh "$SLUG"      # backdated activity timeline
-bash helpers/04-custom.sh "$SLUG"           # custom objects, custom events (if needed)
-bash helpers/05-forms.sh "$SLUG"            # form creation + submissions
-bash helpers/06-marketing.sh "$SLUG"        # marketing email + landing page (if needed)
-bash helpers/07-workflows.sh "$SLUG"        # workflows + lead scoring
-```
-
-Each helper:
-- Reads `/tmp/demo-prep-<slug>/build-plan.json` for what to build
-- Reads `/tmp/demo-prep-<slug>/research.json` for branding/copy inputs
-- Writes back to `/tmp/demo-prep-<slug>/manifest.json` recording every created artifact (id, name, URL, type)
-- Tags every asset with the custom property `demo_customer = <slug>` for cleanup
-
-For workflow actions the API can't handle (Send Email, Send SMS, AI Step, complex branching), the helper:
-- Builds the workflow shell up to the unsupported action
-- Logs the gap to `/tmp/demo-prep-<slug>/manual-steps.json` with: workflow name, step name, what to add, exact UI URL
-
-### Phase 4: Output
+After Phase 1 (research) and Phase 2 (synthesize) have written `research.json` and `build-plan.json` to `/tmp/demo-prep-<slug>/`, run:
 
 ```bash
-bash helpers/08-output.sh "$SLUG"
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/hubspot-demo-prep/builder.py" <slug>
 ```
 
-Generates a Google Doc per `references/google-doc-template.md`:
-- Customer name + date in title
-- Logo screenshot + color swatches at the top
-- Demo agenda (3 items + Easter egg as 4th, or 4 items if rep provided agenda)
-- "What was built" with clickable links to every artifact in HubSpot
-- Research summary (3-5 paragraphs, sources cited)
-- "Manual steps before demo" (if any)
-- Pre-demo checklist
-- Cleanup command
-- Doc lives in a "HubSpot Demo Prep" Drive folder (created on first run)
+Or, when running outside a plugin context (development):
 
-Returns the Doc URL.
+```bash
+python3 ~/.claude/skills/hubspot-demo-prep/skills/hubspot-demo-prep/builder.py <slug>
+```
+
+This runs all 17 phases monolithically:
+- Properties, company, contacts, leads, pipeline + deals, tickets, engagements (parallel)
+- Custom object + custom events
+- Forms + form submissions
+- Lead scoring + hot leads list
+- Marketing email (with AI hero image when present)
+- Workflows (best-effort via v4 flows API; graceful manual_step fallback)
+- Quotes + invoices + calc property + marketing campaign
+- **Phase 17: Generate demo doc** — calls `doc_generator.py` to produce `/tmp/demo-prep-<slug>/demo-doc.docx` with full formatting (banner, agenda pills, links, brand colors), then uploads to the project's Drive folder. The Drive URL is returned and printed.
+
+The verification loop runs alongside (16 phase verifications, retry-once on empty), and `manifest.json` records every artifact for cleanup.
+
+Optional flags:
+- `--playwright` — also run Playwright UI flows for branding, workflows, quote template (off by default; selectors are still under iteration)
+- `--first-run` — interactive HubSpot login for the first Playwright session (subsequent runs reuse storage state at `~/.claude/data/hubspot-demo-prep/state/`)
+
+### Phase 4: Surface the result
+
+After `builder.py` completes:
+- Print the Drive URL of the generated demo doc (or local `.docx` path if Drive upload was skipped due to quota)
+- Print the build summary (counts, errors, verifications X/Y)
+- List any manual steps written to `manifest.json["manual_steps"]`
+- Do NOT write or rewrite the demo doc yourself — it has already been generated and uploaded
 
 ### Phase 5: Cleanup (when done with the demo)
 

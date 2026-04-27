@@ -1,6 +1,6 @@
 {
   "name": "hubspot-demo-prep",
-  "description": "HubSpot demo environment generator — tailor a sandbox to any prospect in minutes",
+  "description": "HubSpot demo environment generator \u2014 tailor a sandbox to any prospect in minutes",
   "owner": {
     "name": "Jeremy Sagaille"
   },
@@ -8,7 +8,7 @@
     {
       "name": "hubspot-demo-prep",
       "description": "Generate a tailored, live-feeling HubSpot demo environment for a specific customer. Includes the /hotdog slash command and full skill workflow.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": "./",
       "author": {
         "name": "Jeremy Sagaille"

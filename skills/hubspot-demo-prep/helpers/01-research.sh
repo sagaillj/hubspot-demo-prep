@@ -1,19 +1,44 @@
 #!/usr/bin/env bash
 # Research the target company. Outputs /tmp/demo-prep-<slug>/research.json.
-# This helper is mechanical — it runs Firecrawl, Playwright screenshot, and
-# Perplexity search. Synthesis happens in Claude (called from SKILL.md after).
+# Runs Firecrawl, Playwright screenshot, and Perplexity IN PARALLEL.
+# Caches research.json for 24h per slug; pass --no-cache to force re-fetch.
 #
-# Usage: 01-research.sh <slug> <url-or-domain> ["stated context, comma-separated"]
+# Usage: 01-research.sh <slug> <url-or-domain> ["stated context"] [--no-cache]
 
 source "$(dirname "$0")/lib.sh"
 load_env
 
-SLUG="${1:-}"
-URL="${2:-}"
-CONTEXT="${3:-}"
-[[ -n "$SLUG" && -n "$URL" ]] || fail "Usage: 01-research.sh <slug> <url> [\"context\"]"
+# Parse args (accept --no-cache anywhere)
+NO_CACHE=0
+ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "--no-cache" ]]; then
+    NO_CACHE=1
+  else
+    ARGS+=("$arg")
+  fi
+done
+
+SLUG="${ARGS[0]:-}"
+URL="${ARGS[1]:-}"
+CONTEXT="${ARGS[2]:-}"
+[[ -n "$SLUG" && -n "$URL" ]] || fail "Usage: 01-research.sh <slug> <url> [\"context\"] [--no-cache]"
 
 WORK="$(work_dir "$SLUG")"
+
+# ---- Cache check (24h TTL) ----
+RESEARCH_OUT="$WORK/research.json"
+if [[ "$NO_CACHE" -eq 0 && -f "$RESEARCH_OUT" ]]; then
+  AGE_SECONDS=$(( $(date +%s) - $(stat -f %m "$RESEARCH_OUT" 2>/dev/null || stat -c %Y "$RESEARCH_OUT" 2>/dev/null || echo 0) ))
+  AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+  if [[ "$AGE_SECONDS" -lt 86400 ]]; then
+    ok "Using cached research (${AGE_HOURS}h old): $RESEARCH_OUT"
+    info "  Pass --no-cache to force a fresh fetch."
+    exit 0
+  else
+    info "Cached research is ${AGE_HOURS}h old (>24h); re-fetching."
+  fi
+fi
 
 # Normalize URL
 if [[ "$URL" != http* ]]; then
@@ -25,25 +50,12 @@ info "Researching $URL"
 info "Domain: $DOMAIN"
 info "Context: ${CONTEXT:-(none)}"
 
-# ---- Firecrawl ----
 FIRECRAWL_OUT="$WORK/firecrawl.json"
-info "Step 1: Firecrawl scrape..."
-if command -v ~/.claude/bin/firecrawl >/dev/null; then
-  ~/.claude/bin/firecrawl scrape "$URL" --formats markdown > "$FIRECRAWL_OUT" 2>&1 || warn "Firecrawl returned non-zero"
-  if grep -q '"success":true' "$FIRECRAWL_OUT" 2>/dev/null; then
-    ok "  Firecrawl returned data"
-  else
-    warn "  Firecrawl did not succeed (DNS / 404 / etc); will fall back to Playwright"
-  fi
-else
-  warn "  Firecrawl wrapper not installed, skipping"
-fi
-
-# ---- Playwright screenshot + DOM extraction ----
 SCREENSHOT="$WORK/homepage.png"
 DOM_DUMP="$WORK/dom.json"
-info "Step 2: Playwright screenshot + DOM..."
+PERPLEXITY_OUT="$WORK/perplexity.json"
 
+# ---- Build the Playwright script up-front so it's ready to launch ----
 cat > "$WORK/playwright-script.js" <<EOF
 const { chromium } = require('playwright');
 (async () => {
@@ -61,7 +73,6 @@ const { chromium } = require('playwright');
       const computed = getComputedStyle(document.body);
       const colors = new Set([themeColor].filter(Boolean));
 
-      // Sample CSS colors from prominent elements
       ['header', 'nav', 'h1', 'h2', '.btn', 'button', 'a'].forEach(sel => {
         document.querySelectorAll(sel).forEach(el => {
           const cs = getComputedStyle(el);
@@ -92,33 +103,65 @@ const { chromium } = require('playwright');
 })();
 EOF
 
-(cd /tmp && npx playwright --version >/dev/null 2>&1 && \
-  node "$WORK/playwright-script.js" 2>&1 | head -20) || warn "Playwright execution failed"
+# ---- Launch all three research sources in parallel ----
+info "Launching Firecrawl + Playwright + Perplexity in parallel..."
 
-if [[ -f "$SCREENSHOT" ]]; then
-  ok "  Screenshot saved: $SCREENSHOT"
+FIRECRAWL_PID=""
+if command -v ~/.claude/bin/firecrawl >/dev/null; then
+  ( ~/.claude/bin/firecrawl scrape "$URL" --formats markdown > "$FIRECRAWL_OUT" 2>&1 ) &
+  FIRECRAWL_PID=$!
 else
-  warn "  No screenshot; site may be JS-blocked or DNS-failed"
+  warn "  Firecrawl wrapper not installed, skipping"
 fi
 
-# ---- Perplexity industry research ----
-PERPLEXITY_OUT="$WORK/perplexity.json"
-info "Step 3: Perplexity industry research..."
+PLAYWRIGHT_PID=""
+if (cd /tmp && npx playwright --version >/dev/null 2>&1); then
+  ( node "$WORK/playwright-script.js" > "$WORK/playwright.log" 2>&1 ) &
+  PLAYWRIGHT_PID=$!
+else
+  warn "  Playwright not available, skipping screenshot"
+fi
 
-# Build a context-aware research prompt
-research_prompt="What does the company at $URL do, what's their target customer ICP, what industry are they in, and what are the most-cited pain points for businesses in their industry that don't have a marketing team / use HubSpot or similar CRM? Provide stats with citations. Context from the rep: $CONTEXT"
-
+PERPLEXITY_PID=""
 if command -v ~/.claude/bin/perplexity >/dev/null; then
-  ~/.claude/bin/perplexity "$research_prompt" > "$PERPLEXITY_OUT" 2>&1 || warn "Perplexity returned non-zero"
-  if [[ -s "$PERPLEXITY_OUT" ]]; then
-    ok "  Perplexity returned data"
-  fi
+  research_prompt="What does the company at $URL do, what's their target customer ICP, what industry are they in, and what are the most-cited pain points for businesses in their industry that don't have a marketing team / use HubSpot or similar CRM? Provide stats with citations. Context from the rep: $CONTEXT"
+  ( ~/.claude/bin/perplexity "$research_prompt" > "$PERPLEXITY_OUT" 2>&1 ) &
+  PERPLEXITY_PID=$!
 else
   warn "  Perplexity wrapper not installed, skipping"
 fi
 
+# Wait for each, report status
+if [[ -n "$FIRECRAWL_PID" ]]; then
+  if wait "$FIRECRAWL_PID"; then
+    if grep -q '"success":true' "$FIRECRAWL_OUT" 2>/dev/null; then
+      ok "  Firecrawl returned data"
+    else
+      warn "  Firecrawl did not succeed (DNS / 404 / etc); will fall back to Playwright/Perplexity output"
+    fi
+  else
+    warn "  Firecrawl returned non-zero"
+  fi
+fi
+
+if [[ -n "$PLAYWRIGHT_PID" ]]; then
+  wait "$PLAYWRIGHT_PID" || warn "  Playwright execution failed"
+  if [[ -f "$SCREENSHOT" ]]; then
+    ok "  Screenshot saved: $SCREENSHOT"
+  else
+    warn "  No screenshot; site may be JS-blocked or DNS-failed"
+  fi
+fi
+
+if [[ -n "$PERPLEXITY_PID" ]]; then
+  wait "$PERPLEXITY_PID" || warn "  Perplexity returned non-zero"
+  if [[ -s "$PERPLEXITY_OUT" ]]; then
+    ok "  Perplexity returned data"
+  fi
+fi
+
 # ---- Consolidate ----
-info "Step 4: Consolidating research..."
+info "Consolidating research..."
 
 python3 - <<PYEOF
 import json, os, re
@@ -154,7 +197,6 @@ if os.path.exists(pp_path):
     try:
         perplexity = json.load(open(pp_path))
     except Exception:
-        # Maybe plain text
         perplexity = {'raw': open(pp_path).read()}
 
 # Extract brand colors. Prefer Firecrawl theme-color, fall back to Playwright
@@ -177,7 +219,6 @@ for c in dom.get('colors', []):
     if n.startswith('#') and n not in colors and len(colors) < 5:
         colors.append(n)
 
-# Heuristic: pick first non-grayscale as primary
 def is_gray(hex_c):
     if not hex_c.startswith('#') or len(hex_c) < 7:
         return True
@@ -188,16 +229,10 @@ primary = next((c for c in colors if not is_gray(c)), colors[0] if colors else '
 secondary = next((c for c in colors if c != primary and not is_gray(c)), '#33475B')
 accent = next((c for c in colors if c not in (primary, secondary) and not is_gray(c)), '#00BDA5')
 
-# Logo: prefer og:image, then favicon
 logo_url = fc_meta.get('og:image') or fc_meta.get('twitter:image') or dom.get('ogImage') or dom.get('favicon') or ''
-
-# Company name from og:title or title
 company_name = (fc_meta.get('og:title') or fc_meta.get('title') or dom.get('ogTitle') or dom.get('title') or domain).split('|')[0].split('-')[0].strip()
-
-# Description
 description = fc_meta.get('description') or fc_meta.get('og:description') or dom.get('description') or ''
 
-# Sources for citations
 sources = [url]
 if perplexity.get('citations'):
     sources.extend(perplexity['citations'])
@@ -224,8 +259,8 @@ research = {
     'perplexity': perplexity,
     'stated_context': context,
     'sources': sources,
-    'summary': '',  # to be filled by Claude in synthesis phase
-    'industry_stats': []  # to be filtered by Claude
+    'summary': '',
+    'industry_stats': []
 }
 
 with open(f"{work}/research.json", 'w') as f:
