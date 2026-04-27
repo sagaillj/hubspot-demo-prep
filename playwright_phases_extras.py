@@ -292,7 +292,7 @@ def create_starter_dashboard(slug: str, customer_name: str,
         return {**summary, "error": f"session-init: {e}"}
 
     with session_cm as session:
-        portal = session.portal
+        portal = session.portal_id
         page = session.page
         if page is None:
             _fail("page is None — Playwright failed to launch")
@@ -559,7 +559,7 @@ def create_saved_views(slug: str, portal_id: str, work_dir: str | None = None,
 
     with session_cm as session:
         page = session.page
-        portal = session.portal
+        portal = session.portal_id
         if page is None:
             _fail("page is None — Playwright failed to launch")
             return {**summary, "error": "page-init-none"}

@@ -255,7 +255,7 @@ class PlaywrightSession:
             "viewport": {"width": 1440, "height": 900},
             # Default UA — don't spoof, HubSpot sees Chrome-on-Mac, fine.
         }
-        if _has_state(self.slug) and not self.first_run:
+        if _has_state(self.portal_id) and not self.first_run:
             ctx_kwargs["storage_state"] = self.state_path
             _ok(f"loaded storage state: {self.state_path}")
         else:
@@ -277,18 +277,42 @@ class PlaywrightSession:
     def _interactive_login(self) -> None:
         """
         On --first-run, open HubSpot login and wait for the user to complete
-        Google OAuth or password sign-in. Detects success by waiting for the
-        portal home URL, then saves storage state.
+        Google OAuth or password sign-in. Detects success by waiting for ANY
+        post-login HubSpot URL with a numeric portal id (the user may land on
+        their default portal, not necessarily the sandbox), then explicitly
+        navigates to the sandbox portal before saving storage state.
         """
         assert self.page is not None and self.context is not None
         _log("first-run: opening HubSpot login. Sign in interactively.")
         self.page.goto(f"{HUBSPOT_BASE}/login", wait_until="domcontentloaded")
         try:
+            # Match any logged-in HubSpot URL — common landing paths after auth
+            # include /home-beta, /reports-dashboard/<portal>, /contacts/<portal>,
+            # etc. The /portal-id-prefixed paths all contain a numeric portal id.
             self.page.wait_for_url(
-                re.compile(rf"{re.escape(HUBSPOT_BASE)}/.*/{self.portal_id}.*"),
+                re.compile(rf"{re.escape(HUBSPOT_BASE)}/(home|reports-dashboard|contacts|crm|sales|marketing|settings|account)"),
                 timeout=300_000,
             )
-            _ok("login detected — saving storage state")
+            _ok("login detected — switching to sandbox portal")
+            # Force a navigation to the sandbox portal so the saved storage
+            # state is keyed to the right portal context.
+            self.page.goto(
+                f"{HUBSPOT_BASE}/contacts/{self.portal_id}",
+                wait_until="domcontentloaded",
+            )
+            try:
+                self.page.wait_for_url(
+                    re.compile(rf"{re.escape(HUBSPOT_BASE)}/.*/{self.portal_id}.*"),
+                    timeout=60_000,
+                )
+                _ok(f"in sandbox portal {self.portal_id}")
+            except PlaywrightTimeoutError:
+                _warn(
+                    f"could not auto-switch to portal {self.portal_id}. "
+                    "If this account has multiple portals, click the avatar → "
+                    "Account & Billing → switch to portal "
+                    f"{self.portal_id}, then re-run."
+                )
             self.context.storage_state(path=self.state_path)
             _ok(f"storage state saved: {self.state_path}")
         except PlaywrightTimeoutError:

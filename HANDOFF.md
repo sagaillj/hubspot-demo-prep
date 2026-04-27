@@ -329,3 +329,74 @@ Today:
 Sandbox 51393541. Last manifest: /tmp/demo-prep-shipperzinc/manifest.json.
 Latest demo doc: https://docs.google.com/document/d/13W2ooC7VqpmWfVd5BR89ZOqnAtjbg_lE86WkkTlmStU/edit
 ```
+
+---
+
+## v4.5 session — 2026-04-26 late evening (Playwright reality check)
+
+### Wins
+
+1. **Multi-portal login flow** — Jeremy's Google account redirected to
+   production portal `20708362` instead of sandbox `51393541` after auth,
+   and the previous URL-match regex demanded the sandbox id, so login
+   timed out at 5 min. Fix in `playwright_phases.py:_interactive_login`:
+   relax the post-login regex to match any logged-in HubSpot path
+   (`/home`, `/reports-dashboard`, `/contacts`, etc.), then explicitly
+   `goto(/contacts/{sandbox_portal})` to switch portals before saving
+   storage state. Worked first try.
+
+2. **Storage-state load bug** — `_has_state(self.slug)` should have been
+   `_has_state(self.portal_id)`; the state file is keyed per portal, not
+   per slug. Without this fix the saved session would never load on
+   subsequent runs and every run would prompt for login.
+
+3. **Extras attribute bug** — `playwright_phases_extras.py` referenced
+   `session.portal` (the dashboard + saved-views flows). The
+   `PlaywrightSession` only has `.portal_id`. Two replacements; both
+   flows now don't crash on import.
+
+4. **Storage state saved** — `state/portal-51393541-hubspot.json` (57KB).
+   Future runs (`--playwright` without `--first-run`) skip login entirely.
+
+### Reality on Playwright UI selectors
+
+All 6 Playwright UI phases failed on selector timeouts (30s each).
+This is consistent with the v2 HANDOFF warning: "ALL Playwright
+selectors are GUESSED (text/role-based, not CSS)." Each failure
+fell back to a `manual_step` per the `_safe_flow` design — no
+crashes, but **0/6 flows actually built anything in the UI**.
+Screenshots saved at `/tmp/demo-prep-shipperzinc/playwright/` for each
+timeout; useful for manual selector debugging next session.
+
+Phases that timed out:
+- `upload_portal_branding` — selector `re.compile(r"primary\s*color")`
+- `create_workflow_lead_nurture` — selector `re.compile(r"contact[\-\s]based")`
+- `create_workflow_nps_routing` — same as above
+- `create_quote_template` — selector `re.compile(r"create\s+(new\s+)?template")`
+- `create_sales_sequence` — selector `re.compile(r"create\s+sequence")`
+- `kick_off_seo_scan` — selector `re.compile(r"get\s+audit|run\s+audit")`
+
+Each of these needs a real-DOM inspection pass on the live HubSpot UI to
+update selectors. Probably 30-60 min per flow if HubSpot's UI is stable.
+
+### What this means for Friday's demo recording
+
+The API path is demo-viable today (15/16 verified, 4 errors, all the
+visible-in-demo artifacts created). Playwright doesn't add demo value
+yet — selectors need iteration before any of those phases produce
+real artifacts. The doc currently renders workflows as `[BUILD LIVE]`,
+which is the right pill: rep walks that step live.
+
+### Open questions for next session
+
+- Decide whether to invest in selector iteration (high cost, brittle,
+  needs HubSpot UI to be stable across portals) or commit to the API +
+  manual_steps approach for v5. The "premium" demo phases (workflows,
+  branding, dashboards) might be cheaper to build via the
+  Workflow-template-clone approach hinted at in the v2 HANDOFF
+  (clone an existing UI-built workflow, mutate the body shape per
+  customer). That avoids both v4 flows API 500s AND brittle UI selectors.
+- Form submissions 0/n still pre-existing bug, not investigated.
+- Plugin wrap (`.claude-plugin/plugin.json` + marketplace.json + GitHub
+  push) deferred per Jeremy.
+
