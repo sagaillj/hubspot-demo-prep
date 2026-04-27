@@ -66,7 +66,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_TIMEOUT_MS = 30_000
 NETWORK_IDLE_TIMEOUT_MS = 45_000
 SCREENSHOT_DIR_TEMPLATE = "/tmp/demo-prep-{slug}/playwright"
-STATE_DIR = os.path.expanduser("~/.claude/skills/hubspot-demo-prep/state")
+STATE_DIR = os.path.expanduser("~/.claude/data/hubspot-demo-prep/state")
 ENV_PATH = os.path.expanduser("~/.claude/api-keys.env")
 HUBSPOT_BASE = "https://app.hubspot.com"
 

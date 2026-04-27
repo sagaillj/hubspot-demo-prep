@@ -1,0 +1,18 @@
+{
+  "name": "hubspot-demo-prep",
+  "description": "Generate a tailored, live-feeling HubSpot demo environment for a specific customer in minutes. Researches the prospect, builds an ICP-realistic CRM dataset, generates branded marketing assets, configures workflows, and produces a polished demo runbook.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Jeremy Sagaille"
+  },
+  "homepage": "https://github.com/jeremysagaille/hubspot-demo-prep",
+  "repository": "https://github.com/jeremysagaille/hubspot-demo-prep",
+  "license": "MIT",
+  "keywords": [
+    "hubspot",
+    "demo",
+    "crm",
+    "sales-engineering",
+    "marketing-automation"
+  ]
+}
