@@ -81,6 +81,39 @@ Outputs to `/tmp/demo-prep-<slug>/research.json`:
    - Conditional (only if relevant to agenda or Easter egg): custom object, custom event, marketing email, landing page, NPS form, lead scoring, additional workflows.
    - Quotes / invoices: only if explicitly relevant.
 
+5. **Plan content fields (v0.3.0).** Authoritative schema: `docs/punch-lists/2026-04-26-post-test-tweaks/plan-schema.md`. Every consumer (`builder.py`, `doc_generator.py`, `playwright_phases_extras.py`) has a safe industry-neutral fallback if a field is missing — but the demo only feels real if Phase 2 actually populates these with the prospect's vocabulary, not Shipperz's, not Boomer's, not the previous run's. Generate every field below using the prospect's industry, services, and brand voice as the source of truth:
+
+   - **`branding`** — `primary_color`, `secondary_color`, `accent_color`, `neutral_dark`, `neutral_light` (hex). Pull from research.json branding; do NOT default to `#FF6B35` (transport orange). The doc + email + form theme all read from this.
+   - **`property_group`** — `name` (e.g. `f"{slug}_demo_properties"`) and `label` (e.g. `f"Demo ({company_name})"`). Visible in HubSpot property admin; must not say "Shipperz Demo" for non-Shipperz prospects.
+   - **`activity_content`** — pools used by `create_engagements`: `notes_pool`, `tasks_pool`, `calls_pool`, `meetings_pool`, `emails_pool`, plus optional `per_contact_engagements` for hand-tuned per-contact timelines. Also `lead_label_template` (e.g. `"{industry_noun} inquiry"`), `lead_labels`, `lead_sources`. Every body string should use this prospect's services, pain points, and industry terminology — not generic shipping/transport copy.
+   - **`quote_catalog`** — 5-7 line items priced for this industry's actual deal sizes. A marine audio shop is not selling "enclosed transport"; an agency is not selling "premium service tier."
+   - **`marketing_email`** — full structured body: `body_html` (inline-styled), `cta_text`, `cta_url`, `cta_color`, `footer_tagline` (company name only, no industry suffix), and `steps` (the "what happens next" timeline). CTA copy must match the prospect's actual website CTA pattern (B2B SaaS: "Schedule a demo"; local services: "Get a free quote"; product: "Shop now"). The hero image path is filled in by the image-gen step below.
+   - **`marketing_campaign`** — `name`, `start_date`, `end_date`, `notes`, `audience`, `utm_campaign`. Replaces the legacy hardcoded "Snowbird Season Q1 2026". Pick a seasonal or topical angle that's actually relevant to this prospect.
+   - **`forms[].theme`** — `submit_button_color` (defaults to `branding.primary_color`) and `submit_text_color`. For the NPS form, also include `forms[].test_submission_data`: `first_names`, `last_names`, `score_distribution`, `feedback_pool`. Use names + feedback that fit the prospect's customer base.
+   - **`recommendation_text`** — the doc's "how to lead the demo" paragraph. Generate prospect-specific copy that references real plan values (sample contact name, agenda items, custom object name). **Critical:** any dollar amount you cite MUST exist as a deal in the manifest. Otherwise omit the dollar amount. (See Quality Gate item 6 — phantom numbers killed the Boomer demo with a "$4,200 boat install" that never existed.)
+   - **`playwright_dashboard`** — `name` (e.g. `f"{company_name} Daily Snapshot"`), `filter_pipeline_name` (matches the actual pipeline name in this plan), `filter_stages` (prospect-specific stage names). Required when `--playwright` is used; otherwise the dashboard inherits leftover Shipperz naming.
+   - **`doc_replacement_id`** (optional) — Google Doc template ID override; replaces the legacy `if self.slug == "shipperzinc"` branching. Leave unset for default behavior.
+
+6. **Generate the marketing email hero image.** Run this immediately before invoking `builder.py`. Detect available providers in priority order:
+
+   1. **Recraft MCP** (preferred — free tier, 30 credits/day): if `mcp__recraft__generate_image` is callable in the orchestrator session, use it directly. Print `Using Recraft (free tier). Want to switch?` so the user can override.
+   2. **OpenAI gpt-image-1**: if `OPENAI_API_KEY` is set in env, run `bash ${CLAUDE_PLUGIN_ROOT}/skills/hubspot-demo-prep/helpers/09-generate-hero.sh openai <slug>`.
+   3. **Google Gemini imagen**: if `GEMINI_API_KEY` (or `GOOGLE_AI_STUDIO_KEY`) is set, run `bash ${CLAUDE_PLUGIN_ROOT}/skills/hubspot-demo-prep/helpers/09-generate-hero.sh gemini <slug>`.
+   4. **None available**: skip image generation; `builder.py` will create the email without a hero (no manual step required).
+
+   Once an image is generated to `/tmp/demo-prep-<slug>/hero-image.png`, write its path into `plan["marketing_email"]["hero_image_path"]` so `builder.py` uploads it. The user can override provider selection with `HUBSPOT_DEMO_HERO_PROVIDER=recraft|openai|gemini|none`.
+
+7. **Phase 2 Quality Gate — must pass before invoking `builder.py`.** Before writing the final `build-plan.json`, run these 6 checks mentally on the plan you just generated. If any check fails, fix the plan before continuing. The cost of failing here is a prospect noticing a "wait, this isn't really for me" detail — which kills the demo.
+
+   1. **No terminology reuse from prior runs.** No phrasing carried over from a previous prospect. Search the plan you wrote for any of: `"shipment"`, `"snowbird"`, `"transport"`, `"vehicle"`, `"route"`, `"Tesla"`, `"marine"`, `"boat"`, `"audio"`, `"install"`, `"HVAC"`, `"furnace"` and confirm each instance is genuinely correct for THIS prospect's industry — not an artifact of a prior run's leakage.
+   2. **Persona freshness.** Re-infer contact personas from this prospect's `research.json` + industry + GTM model. Don't reuse personas from any previous run.
+   3. **Deal-stage prospect-specificity.** Pipeline stages reflect this prospect's actual sales cycle (e.g. SaaS: "Demo Scheduled / Proposal / Negotiation / Closed-won"; agency: "Discovery / Scope / Signed / Kickoff"; services: "Inquiry / Quote / Scheduled / Completed").
+   4. **Custom object naming.** Object name reflects the prospect's domain (`audio_installation_job` not `shipment` for a marine audio shop).
+   5. **Email voice-match.** Marketing email CTA style matches the prospect's actual website CTA pattern (B2B SaaS: "Schedule a demo"; local services: "Get a free quote"; product: "Shop now").
+   6. **No phantom numbers.** Any dollar amount cited in `recommendation_text` or any narrative field must correspond to an actual deal amount in the plan. (Recall the Boomer "$4,200 boat install" bug.)
+
+   If any check fails, fix the plan before continuing. The cost of failing here is a prospect noticing a "wait, this isn't really for me" detail — which kills the demo.
+
 ### Phase 3: Build + Output (single Python command, runs all 17 sub-phases incl. demo doc)
 
 **Critical:** all build phases AND the formatted demo doc are produced by a single Python entry point: `builder.py`. Do NOT generate the demo doc yourself with the Drive MCP — `builder.py` calls `doc_generator.py` which produces a properly formatted .docx (banner, agenda status pills, links, branding) and uploads it to Drive. A markdown-only doc is a regression.
@@ -109,6 +142,8 @@ This runs all 17 phases monolithically:
 
 The verification loop runs alongside (16 phase verifications, retry-once on empty), and `manifest.json` records every artifact for cleanup.
 
+**Manual-step reason hygiene.** Any `add_manual_step` call's `reason` string is USER-FACING — it gets rendered into the demo doc the prospect sees. Never put raw API error text there. Forbidden patterns in the visible reason: `"API returned"`, `"500"`, `"rejected"`, `"blocked"`, `"validation"`, `"INVALID_"`. Acceptable rephrases: "Built manually for finer control over branching", "UI build is faster than the API setup", "Configured by hand for advanced logic". The internal manifest can still record the raw error in a separate field for debugging — but the visible `reason` must read as an intentional choice, not a failure.
+
 Optional flags:
 - `--playwright` — also run Playwright UI flows for branding, workflows, quote template (off by default; selectors are still under iteration)
 - `--first-run` — interactive HubSpot login for the first Playwright session (subsequent runs reuse storage state at `~/.claude/data/hubspot-demo-prep/state/`)
@@ -118,8 +153,12 @@ Optional flags:
 After `builder.py` completes:
 - Print the Drive URL of the generated demo doc (or local `.docx` path if Drive upload was skipped due to quota)
 - Print the build summary (counts, errors, verifications X/Y)
+- Surface the pass/fail status of the two new integrity verifiers `builder.py` runs at the end:
+  - **`verify_doc_urls`** (item 6) — confirms every clickable link in the generated demo doc actually resolves to a live HubSpot artifact (no dead deep-links).
+  - **`verify_manifest_integrity`** (item 13) — catches mismatches between configured vs. actual artifact counts (e.g. "8 form submissions configured, 0 recorded" — the Shipperz disconnect).
 - List any manual steps written to `manifest.json["manual_steps"]`
 - Do NOT write or rewrite the demo doc yourself — it has already been generated and uploaded
+- Doc renders a prominent "time saved vs manual build" stat at the top + breakdown table at the bottom, computed from manifest counts × per-phase minute estimates.
 
 ### Phase 5: Cleanup (when done with the demo)
 

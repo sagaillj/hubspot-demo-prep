@@ -59,21 +59,21 @@ Deal stage body example:
 | Create record | `POST /crm/v3/objects/{objectTypeId}` |
 | Batch records | `POST /crm/v3/objects/{objectTypeId}/batch/create` |
 
-Schema body example:
+Schema body example (illustrative — pick a domain object name that fits the prospect's industry, e.g. `installation_jobs` for a marine audio installer, `service_visits` for a HVAC contractor, `shipments` for logistics, `engagements` for a B2B SaaS):
 ```json
 {
-  "name": "shipments",
-  "labels": {"singular": "Shipment", "plural": "Shipments"},
-  "primaryDisplayProperty": "tracking_number",
-  "secondaryDisplayProperties": ["status", "destination"],
-  "requiredProperties": ["tracking_number"],
-  "searchableProperties": ["tracking_number", "destination"],
+  "name": "{domain_object_name}",
+  "labels": {"singular": "{Singular}", "plural": "{Plural}"},
+  "primaryDisplayProperty": "{primary_id_field}",
+  "secondaryDisplayProperties": ["status", "{descriptor}"],
+  "requiredProperties": ["{primary_id_field}"],
+  "searchableProperties": ["{primary_id_field}", "{descriptor}"],
   "properties": [
-    {"name": "tracking_number", "label": "Tracking Number", "type": "string", "fieldType": "text"},
+    {"name": "{primary_id_field}", "label": "{Primary ID Label}", "type": "string", "fieldType": "text"},
     {"name": "status", "label": "Status", "type": "enumeration", "fieldType": "select",
-     "options": [{"label": "In Transit", "value": "in_transit", "displayOrder": 1},
-                 {"label": "Delivered", "value": "delivered", "displayOrder": 2}]},
-    {"name": "destination", "label": "Destination", "type": "string", "fieldType": "text"}
+     "options": [{"label": "{Stage 1}", "value": "{stage_1_internal}", "displayOrder": 1},
+                 {"label": "{Stage 2}", "value": "{stage_2_internal}", "displayOrder": 2}]},
+    {"name": "{descriptor}", "label": "{Descriptor Label}", "type": "string", "fieldType": "text"}
   ],
   "associatedObjects": ["CONTACT", "DEAL"]
 }
@@ -86,12 +86,12 @@ Schema body example:
 | Create event definition | `POST /events/v3/event-definitions` |
 | Send event | `POST /events/v3/send` |
 
-Send body example:
+Send body example (illustrative — pick an event name that matches the prospect's actual user action, e.g. `pe<portalId>_install_booked` for a service business, `pe<portalId>_trial_started` for B2B SaaS, `pe<portalId>_shipping_quote_requested` for logistics):
 ```json
 {
-  "eventName": "pe<portalId>_shipping_quote_requested",
+  "eventName": "pe<portalId>_{prospect_action_event}",
   "email": "contact@example.com",
-  "properties": {"weight_lbs": 250, "destination": "TX"},
+  "properties": {"{relevant_property}": "{value}"},
   "occurredAt": "2026-03-15T10:00:00Z"
 }
 ```

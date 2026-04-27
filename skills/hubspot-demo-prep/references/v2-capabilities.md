@@ -16,7 +16,7 @@ Demo-value rating key: H = "lived-in" feel a buyer would notice on the call. M =
 | List sequences | YES | `GET /automation/sequences/2026-03` | — | `automation.sequences.read` | Returns sequences already authored. | M |
 | Enroll contact | YES | `POST /automation/sequences/2026-03/enrollments` | `{"contactId":"123","sequenceId":"44","senderEmail":"rep@portal.com"}` | `automation.sequences.enrollments.write` | Sender email must be a connected inbox owned by a paid Sales/Service Hub seat. 1,000 enrollments / portal / day cap. | H |
 
-Recipe: hand-author a "Shipperz Q2 outbound" sequence in UI once, then have the skill enroll the demo contacts. See https://developers.hubspot.com/docs/api-reference/automation-sequences-v4/guide
+Recipe: hand-author a "{CustomerName} Q2 outbound prospecting" sequence in UI once, then have the skill enroll the demo contacts. See https://developers.hubspot.com/docs/api-reference/automation-sequences-v4/guide
 
 ---
 
@@ -45,10 +45,10 @@ Sample create body (matches builder's existing pattern):
 ```json
 {
   "properties": {
-    "hs_title": "Shipperz - Q2 LTL Pricing",
+    "hs_title": "{CustomerName} - Q2 Pricing",
     "hs_expiration_date": "2026-06-30",
     "hs_currency": "USD",
-    "demo_customer": "shipperz"
+    "demo_customer": "{slug}"
   },
   "associations": [
     {"to":{"id":"<dealId>"},"types":[{"associationCategory":"HUBSPOT_DEFINED","associationTypeId":64}]},
@@ -78,7 +78,7 @@ Sample body:
     "hs_currency": "USD",
     "hs_invoice_date": "2026-03-15T00:00:00Z",
     "hs_due_date": "2026-04-15T00:00:00Z",
-    "demo_customer": "shipperz"
+    "demo_customer": "{slug}"
   },
   "associations": [
     {"to":{"id":"<contactId>"},"types":[{"associationCategory":"HUBSPOT_DEFINED","associationTypeId":177}]},
@@ -167,10 +167,10 @@ Sample body:
 ```json
 {
   "properties": {
-    "hs_lead_name": "Jane Doe - LTL inquiry",
+    "hs_lead_name": "Jane Doe - {primary_inquiry_topic}",
     "hs_lead_type": "NEW_BUSINESS",
     "hs_lead_label": "WARM",
-    "demo_customer": "shipperz"
+    "demo_customer": "{slug}"
   },
   "associations": [
     {"to":{"id":"<contactId>"},"types":[{"associationCategory":"HUBSPOT_DEFINED","associationTypeId":578}]}
@@ -180,7 +180,7 @@ Sample body:
 
 `hs_lead_label` enum: COLD/WARM/HOT. `hs_lead_type` enum: NEW_BUSINESS/EXISTING_BUSINESS/etc. Source: https://developers.hubspot.com/docs/reference/api/crm/objects/leads
 
-This is **the highest-leverage addition** — Jeremy's prospects opening Sales Workspace and seeing a populated leads queue is exactly the "lived-in" effect.
+This is **the highest-leverage addition** — prospects opening Sales Workspace and seeing a populated leads queue creates a "lived-in" effect.
 
 ---
 
@@ -192,9 +192,9 @@ This is **the highest-leverage addition** — Jeremy's prospects opening Sales W
 | Define card | YES | extension JSON: `type:"crm-card"`, `location:"crm.record.tab"`, `objectTypes:["contacts"]` | Card is React + GraphQL. | H |
 | Upload | YES | `hs project upload` | Project files in `<project>/src/app/extensions/`. Example folder `deals-summary` is closest to a "latest shipment" card. | H |
 
-Recipe for a "Latest shipment" card on contact:
+Recipe for a "Latest custom-object record card on contact" (e.g., "Latest shipment" for logistics, "Latest installation" for service businesses, "Latest project" for agencies — name it after whatever object the prospect's domain actually uses):
 1. `hs project create` (template `crm-card`)
-2. Extension reads from custom object `shipments` (already created by `create_custom_object` phase), associated to contact
+2. Extension reads from the custom object created by the `create_custom_object` phase (named per the prospect's domain), associated to contact
 3. `hs project upload --account=demoprep` -> card appears on contact records
 
 Gotcha: this is a multi-file scaffold (`.json` + `.tsx` + `package.json`) — heavy to embed in Python. **Recommendation**: ship a static template under `~/.claude/skills/hubspot-demo-prep/templates/crm-card-shipment/` and have builder.py shell out to `hs project upload --account ${portal}` after token-substituting the slug. Sources: https://developers.hubspot.com/docs/platform/create-custom-crm-cards-with-projects, https://github.com/HubSpot/ui-extensions-examples
@@ -210,7 +210,7 @@ Gotcha: this is a multi-file scaffold (`.json` + `.tsx` + `package.json`) — he
 | Register custom channel | YES | `POST /conversations/v3/custom-channels` | uses dev API key + app id | `conversations.custom_channels.write` | Requires public app, not just private app token. | M |
 | Post message to existing thread | YES | `POST /conversations/v3/conversations/threads/{threadId}/messages` | `{"type":"MESSAGE","text":"...","senderActorId":"..."}` | conversations.write | Need an existing thread first. | M |
 
-**Practical demo recipe**: skill cannot create an inbox, but can post sample messages into an existing thread if one is pre-seeded. Cleaner alternative: pre-create one shared inbox (UI, once) named "Shipperz support", store its `inboxId`, then have builder push 3-5 sample threads using a custom-channel app. **Heavy lift** — better to defer until after #11. Source: https://developers.hubspot.com/docs/api-reference/conversations-custom-channels-v3/guide
+**Practical demo recipe**: skill cannot create an inbox, but can post sample messages into an existing thread if one is pre-seeded. Cleaner alternative: pre-create one shared inbox (UI, once) named "{CustomerName} support", store its `inboxId`, then have builder push 3-5 sample threads using a custom-channel app. **Heavy lift** — better to defer until after #11. Source: https://developers.hubspot.com/docs/api-reference/conversations-custom-channels-v3/guide
 
 ---
 
@@ -226,7 +226,7 @@ Gotcha: this is a multi-file scaffold (`.json` + `.tsx` + `package.json`) — he
 Recipe to fake a saved view with a list:
 ```json
 {
-  "name": "Demo: Hot Leads - Shipperz",
+  "name": "Demo: Hot Leads - {CustomerName}",
   "objectTypeId": "0-1",
   "processingType": "DYNAMIC",
   "filterBranch": {
@@ -275,7 +275,7 @@ Skip from builder. Source: https://community.hubspot.com/t5/APIs-Integrations/Cr
 |---|---|---|---|---|---|---|
 | Calculation property | YES | `POST /crm/v3/properties/{objectType}` | see below | `crm.schemas.{obj}.write` | Use `fieldType:"calculation_equation"`. | M |
 | Score property | NO | (UI only) | — | — | Score-property creation has never been API-exposed. Builder's existing `demo_lead_score` is a plain number — fine. | — |
-| Property group | YES | `POST /crm/v3/properties/{objectType}/groups` | `{"name":"shipperz_demo","label":"Shipperz Demo","displayOrder":-1}` | schemas.write | Useful for keeping demo properties grouped together in UI. | M |
+| Property group | YES | `POST /crm/v3/properties/{objectType}/groups` | `{"name":"{slug}_demo","label":"Demo ({CustomerName})","displayOrder":-1}` | schemas.write | Useful for keeping demo properties grouped together in UI. | M |
 
 Calculation property body:
 ```json
@@ -341,7 +341,7 @@ Ranked by (demo-value x ease-of-implementation). All five are pure HTTP — no n
 - Status transitions are property PATCHes — no special endpoint
 
 ### 4. Calculation property + property group
-**Demo value: M. Effort: ~30 min.** Fast, low-risk, makes properties phase feel polished. Adds `deal_age_days` (DAYS_BETWEEN formula) and groups all demo properties under a "Shipperz Demo" property group instead of `contactinformation`.
+**Demo value: M. Effort: ~30 min.** Fast, low-risk, makes properties phase feel polished. Adds `deal_age_days` (DAYS_BETWEEN formula) and groups all demo properties under a per-customer property group (e.g., `Demo ({CustomerName})`) instead of `contactinformation`.
 - Same `POST /crm/v3/properties/{obj}` already used; new fieldType + new sibling endpoint for groups
 - Cleanup phase needs `DELETE /crm/v3/properties/{obj}/groups/{name}`
 

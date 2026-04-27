@@ -168,6 +168,62 @@ def _save_to_env(key: str, value: str) -> None:
     _ok(f"env: {'updated' if found else 'appended'} {key}")
 
 
+# ---- Plan loader (mirror playwright_phases_extras._load_plan) ----
+
+def _load_plan(work_dir: str) -> dict[str, Any]:
+    """
+    Load build-plan.json from {work_dir}. Returns {} on any failure (missing
+    file, malformed JSON, permission error) so callers can use
+    `plan.get(...)` patterns without guarding against None. Phase 2
+    (orchestrator) writes this file; if it's absent, downstream code falls
+    back to industry-neutral defaults derived from customer_name + manifest.
+    """
+    plan_path = os.path.join(work_dir, "build-plan.json")
+    if not os.path.exists(plan_path):
+        return {}
+    try:
+        with open(plan_path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        _warn(f"_load_plan failed reading {plan_path}: {e}")
+        return {}
+
+
+def _load_research(work_dir: str) -> dict[str, Any]:
+    """
+    Load research.json from {work_dir} for industry/keyword fallbacks.
+    Returns {} on any failure.
+    """
+    research_path = os.path.join(work_dir, "research.json")
+    if not os.path.exists(research_path):
+        return {}
+    try:
+        with open(research_path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_manifest(work_dir: str) -> dict[str, Any]:
+    """Load manifest.json from {work_dir}. Returns {} on any failure."""
+    manifest_path = os.path.join(work_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return {}
+    try:
+        with open(manifest_path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _work_dir_for(slug: str, work_dir: str | None = None) -> str:
+    """Resolve work_dir, defaulting to /tmp/demo-prep-{slug}."""
+    return work_dir or f"/tmp/demo-prep-{slug}"
+
+
 # ---- Status dict helpers ----
 
 def _manual_step_result(
@@ -471,6 +527,8 @@ def create_workflow(
     marketing_email_id: str | None = None,
     nps_form_guid: str | None = None,
     contact_id_for_test: str | None = None,
+    customer_name: str | None = None,
+    work_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Workflows → Create → Contact-based → blank. Trigger + actions, save +
@@ -480,6 +538,13 @@ def create_workflow(
 
     Worst case (UI changed): create empty workflow with name + trigger only;
     add manual_step for the rest.
+
+    Workflow name resolution (industry-neutral; previously hardcoded "Shipperz"):
+      1. If `plan["workflows"]` is a list and contains an entry whose name
+         matches the workflow_type intent (lead nurture / NPS), use it.
+      2. Else build `f"{customer_name} - Welcome nurture"` /
+         `f"{customer_name} - NPS routing"` from customer_name.
+      3. Else fall back to slug.
     """
     flow = f"create_workflow_{workflow_type}"
 
@@ -506,11 +571,34 @@ def create_workflow(
         _wait_idle(p)
         _human_pause(p)
 
-        wf_name = (
-            f"Demo: Shipperz Lead Nurture ({slug})"
-            if workflow_type == "lead_nurture"
-            else f"Demo: Shipperz NPS Routing ({slug})"
-        )
+        # Industry-neutral workflow name (previously hardcoded "Shipperz Lead
+        # Nurture" / "Shipperz NPS Routing"). Resolution order:
+        #   1. plan["workflows"][i]["name"] — pick the entry whose name
+        #      contains "nurture"/"welcome" (lead_nurture) or "nps"/"routing"
+        #      (nps_routing). Use as-is.
+        #   2. f"{customer_name} - Welcome nurture" / f"{customer_name} - NPS routing"
+        #   3. f"{slug} - Welcome nurture" / f"{slug} - NPS routing"
+        plan = _load_plan(_work_dir_for(slug, work_dir))
+        cname = customer_name or slug
+        plan_workflows = plan.get("workflows") or []
+        wf_name = None
+        if isinstance(plan_workflows, list):
+            if workflow_type == "lead_nurture":
+                wanted_keywords = ("nurture", "welcome", "lead")
+            else:  # nps_routing
+                wanted_keywords = ("nps", "routing", "survey")
+            for entry in plan_workflows:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if name and any(k in name.lower() for k in wanted_keywords):
+                    wf_name = name
+                    break
+        if not wf_name:
+            if workflow_type == "lead_nurture":
+                wf_name = f"{cname} - Welcome nurture"
+            else:
+                wf_name = f"{cname} - NPS routing"
         try:
             p.get_by_role("textbox", name=re.compile(r"name|workflow\s*name", re.I)).first.fill(wf_name)
             _ok(f"workflow named: {wf_name}")
@@ -621,10 +709,17 @@ def create_quote_template(
     logo_path: str,
     accent_color: str,
     page: "Page",
+    work_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Sales → Quotes → Templates → Create. Use Modern/Classic base, customize
     branding, save. Capture template id, persist to env.
+
+    Quote intro-copy resolution (industry-neutral; previously hardcoded
+    auto-transport "Door-to-door / vehicle and route" copy):
+      1. plan["quote_template"]["intro_copy"] — used verbatim if present.
+      2. Generic neutral 3-step "what happens next" template using
+         {customer_name}.
     """
     flow = "create_quote_template"
 
@@ -672,11 +767,21 @@ def create_quote_template(
         except Exception:
             _warn("business name input not found")
 
-        # Custom intro
+        # Custom intro — industry-neutral. Previously hardcoded auto-transport
+        # copy ("auto transport on the road / vehicle and route").
+        plan = _load_plan(_work_dir_for(slug, work_dir))
+        plan_quote = plan.get("quote_template") or {}
         intro = (
-            f"Thanks for considering {customer_name}. We'll get your auto "
-            "transport on the road fast — see pricing below."
+            (plan_quote.get("intro_copy") or "").strip()
+            if isinstance(plan_quote, dict) else ""
         )
+        if not intro:
+            intro = (
+                f"Thanks for requesting a quote with {customer_name}. "
+                "Here's what happens next: 1. We confirm your details. "
+                "2. You receive a personalized proposal. "
+                "3. We hand-off to your dedicated rep."
+            )
         try:
             p.get_by_label(re.compile(r"intro|introduction|message|comments", re.I)).first.fill(intro)
         except Exception:
@@ -728,12 +833,22 @@ def create_sales_sequence(
     portal_id: str,
     sender_email: str,
     page: "Page",
+    customer_name: str | None = None,
+    work_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Automation → Sequences → Create. Outbound prospecting starter (3 steps),
     customize each step, save, capture id.
 
     Sequences API has no create endpoint (see v2-capabilities.md §1) — UI-only.
+
+    Sequence name + first-step subject/body resolution (industry-neutral;
+    previously hardcoded "Shipperz" / "auto transport"):
+      1. plan["outbound_sequence"]["name"] / .steps[0].subject / .steps[0].body
+         (subject and body fall back independently).
+      2. Else `f"{customer_name} - Outbound nurture"` for name; neutral
+         "{{first_name}}, quick question about {customer_name}" subject; neutral
+         intro body.
     """
     flow = "create_sales_sequence"
 
@@ -760,8 +875,27 @@ def create_sales_sequence(
         _wait_idle(p)
         _human_pause(p)
 
-        # Name
-        seq_name = f"Demo: Shipperz Outbound ({slug})"
+        # Industry-neutral sequence name + step copy (previously hardcoded
+        # "Shipperz Outbound" / "Shipperz auto transport"). Pull from
+        # plan["outbound_sequence"] when available; fall back to customer_name.
+        plan = _load_plan(_work_dir_for(slug, work_dir))
+        plan_seq = plan.get("outbound_sequence") or {}
+        if not isinstance(plan_seq, dict):
+            plan_seq = {}
+        cname = customer_name or slug
+
+        seq_name = (plan_seq.get("name") or "").strip() or f"{cname} - Outbound nurture"
+
+        plan_steps = plan_seq.get("steps") if isinstance(plan_seq.get("steps"), list) else []
+        first_step = plan_steps[0] if plan_steps and isinstance(plan_steps[0], dict) else {}
+        seq_subject = (first_step.get("subject") or "").strip() or (
+            f"{{{{first_name}}}}, quick question about {cname}"
+        )
+        seq_body = (first_step.get("body") or "").strip() or (
+            f"Hi {{{{first_name}}}}, I'd love to learn more about your team's "
+            f"current process and share how {cname} might help. Open to a quick call?"
+        )
+
         try:
             p.get_by_role("textbox", name=re.compile(r"sequence\s*name|name", re.I)).first.fill(seq_name)
         except Exception:
@@ -770,15 +904,10 @@ def create_sales_sequence(
         # Customize first step (subject + body). Deeper customization is
         # fragile — leave step 2/3 to the starter template.
         try:
-            p.get_by_role("textbox", name=re.compile(r"subject", re.I)).first.fill(
-                "Quick question about Shipperz auto transport"
-            )
+            p.get_by_role("textbox", name=re.compile(r"subject", re.I)).first.fill(seq_subject)
             _human_pause(p)
             body_locator = p.get_by_role("textbox").nth(1)
-            body_locator.fill(
-                "Hi {{first_name}}, I help auto transport teams like Shipperz "
-                "tighten their pipeline. Worth a quick call?"
-            )
+            body_locator.fill(seq_body)
         except Exception:
             _warn("could not customize first-step email — leaving template defaults")
 
@@ -826,13 +955,56 @@ def kick_off_seo_scan(
     domain: str,
     page: "Page",
     primary_keyword: str | None = None,
+    work_dir: str | None = None,
 ) -> dict[str, Any]:
     """
     Marketing → SEO → Add topic. Drop the customer's domain + a primary
     keyword. The audit runs async on HubSpot's side (1-3 min). We just kick
     it off and capture the URL.
+
+    Keyword resolution (industry-neutral; previously defaulted to
+    "auto transport"):
+      1. `primary_keyword` arg (caller-provided).
+      2. plan["seo_targets"][0] (or first dict's "keyword"/"name" field).
+      3. research["industry"] from research.json.
+      4. Skip the SEO step gracefully (returns status="skipped") if no
+         keyword can be resolved.
     """
     flow = "kick_off_seo_scan"
+
+    # Resolve keyword BEFORE entering the page-driving closure so we can
+    # skip the entire flow gracefully if there's nothing reasonable to type.
+    def _resolve_keyword() -> str | None:
+        if primary_keyword and primary_keyword.strip():
+            return primary_keyword.strip()
+        wd = _work_dir_for(slug, work_dir)
+        plan = _load_plan(wd)
+        targets = plan.get("seo_targets") if isinstance(plan, dict) else None
+        if isinstance(targets, list) and targets:
+            first = targets[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+            if isinstance(first, dict):
+                for key in ("keyword", "name", "term"):
+                    v = first.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+        research = _load_research(wd)
+        industry = research.get("industry") if isinstance(research, dict) else None
+        if isinstance(industry, str) and industry.strip():
+            return industry.strip()
+        return None
+
+    resolved_keyword = _resolve_keyword()
+    if not resolved_keyword:
+        _warn("kick_off_seo_scan: no keyword available (no primary_keyword arg, "
+              "no plan['seo_targets'], no research['industry']); skipping.")
+        return {
+            "flow": flow,
+            "status": "skipped",
+            "reason": "No SEO keyword available from arg, plan, or research.",
+            "domain": domain,
+        }
 
     def _do(p: "Page") -> dict[str, Any]:
         url = f"{HUBSPOT_BASE}/seo/{portal_id}"
@@ -846,7 +1018,7 @@ def kick_off_seo_scan(
             p.get_by_role("button", name=re.compile(r"get\s+audit|run\s+audit", re.I)).first.click()
         _human_pause(p)
 
-        keyword = primary_keyword or "auto transport"
+        keyword = resolved_keyword
         try:
             p.get_by_label(re.compile(r"core\s*topic|topic|keyword", re.I)).first.fill(keyword)
         except Exception:
@@ -905,6 +1077,7 @@ def run_all_phases(
     nps_form_guid: str | None = None,
     primary_keyword: str | None = None,
     first_run: bool = False,
+    work_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Run all 5 flows sequentially. Each returns a status dict. The list is
@@ -951,11 +1124,15 @@ def run_all_phases(
             slug=slug, portal_id=portal_id,
             workflow_type="lead_nurture", page=page,
             marketing_email_id=marketing_email_id,
+            customer_name=customer_name,
+            work_dir=work_dir,
         ))
         results.append(create_workflow(
             slug=slug, portal_id=portal_id,
             workflow_type="nps_routing", page=page,
             nps_form_guid=nps_form_guid,
+            customer_name=customer_name,
+            work_dir=work_dir,
         ))
         results.append(create_quote_template(
             slug=slug, portal_id=portal_id,
@@ -963,16 +1140,20 @@ def run_all_phases(
             logo_path=logo_path,
             accent_color=accent_color,
             page=page,
+            work_dir=work_dir,
         ))
         results.append(create_sales_sequence(
             slug=slug, portal_id=portal_id,
             sender_email=sender_email,
             page=page,
+            customer_name=customer_name,
+            work_dir=work_dir,
         ))
         results.append(kick_off_seo_scan(
             slug=slug, portal_id=portal_id,
             domain=domain, page=page,
             primary_keyword=primary_keyword,
+            work_dir=work_dir,
         ))
 
     return results
@@ -1022,19 +1203,37 @@ def _main(argv: list[str]) -> int:
     domain = (manifest.get("company") or {}).get("domain") or f"{slug}.com"
     sender_email = env.get("HUBSPOT_DEMOPREP_SENDER_EMAIL", "demo@example.com")
 
-    logo_default = f"/tmp/demo-prep-{slug}/shipperz-og.png"
+    # Industry-neutral defaults. Previously hardcoded "shipperz-og.png" +
+    # "#FF6B35" (transport orange). Logo now derived from slug; brand colors
+    # pulled from build-plan.json (`branding`) → manifest['branding'] →
+    # neutral fallback (#1A1A1A near-black + #3B82F6 slate blue accent).
+    plan = _load_plan(work_dir)
+    plan_brand = (plan.get("branding") or {}) if isinstance(plan, dict) else {}
+    manifest_brand = (manifest.get("branding") or {}) if isinstance(manifest, dict) else {}
+    primary_color_default = (
+        plan_brand.get("primary_color")
+        or manifest_brand.get("primary_color")
+        or "#1A1A1A"
+    )
+    accent_color_default = (
+        plan_brand.get("accent_color")
+        or manifest_brand.get("accent_color")
+        or "#3B82F6"
+    )
+    logo_default = f"/tmp/demo-prep-{slug}/{slug}-og.png"
     results = run_all_phases(
         slug=slug,
         portal_id=portal_id,
         logo_path=logo_default,
-        primary_color="#1A1A1A",
-        accent_color="#FF6B35",
+        primary_color=primary_color_default,
+        accent_color=accent_color_default,
         customer_name=company_name,
         sender_email=sender_email,
         domain=domain,
         marketing_email_id=str(me_id) if me_id else None,
         nps_form_guid=nps_form_guid,
         first_run=first_run,
+        work_dir=work_dir,
     )
 
     out_path = os.path.join(work_dir, "playwright-results.json")

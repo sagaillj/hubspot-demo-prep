@@ -529,3 +529,84 @@ To resume the dod punch list: invoke `/dod` and it picks up the active
 list automatically.
 ```
 
+
+## v0.3.0 — 2026-04-26 night (the big genericization pass)
+
+### What landed
+
+A single batch shipped 14 punch-list items (4 confirmed already-fixed; 10 implemented). The unifying theme: the skill is now genuinely usable for ANY business in ANY industry, not just the original transport prospect.
+
+**Items shipped:**
+1. **Item 4** — quote forms verified working (already fixed in v4 commit 9ce1cb8; original capture conflated workflow rejection with form rejection)
+2. **Item 6** — Marcus Chen URL fixed by enforcing builder.py-generated doc as the only source of truth (item 8 v0.2.0 fix), plus new `verify_doc_urls` parses every hyperlink in the .docx and confirms the contact exists via API GET
+3. **Item 3** — workflow link in doc now prefers `manifest["workflow_urls"][name]` (specific edit URL when v4 succeeded) and falls back to the manual_steps URL otherwise
+4. **Item 5** — engagement content now plan-driven: `plan["activity_content"]["per_contact_engagements"]` provides per-contact unique notes/calls/meetings/emails; falls back to richer pools (`notes_pool`, `calls_pool` as objects with title+body, etc.) — old hardcoded "Productive conversation" strings removed
+5. **Item 2** — NPS form quality: added `dropdown_select` (1-10), `multi_line_text` (open-ended), `number` (with min/max) field types to `create_forms`; theme block applies branded submit color; test submissions use weighted score distribution (50% 9-10, 30% 7-8, 20% 1-6) + feedback pool
+6. **Item 9 (massively expanded after sweep)** — full genericization across builder.py, doc_generator.py, playwright_phases_extras.py, and 5 reference docs:
+   - builder.py: lead names, quote line items, marketing email body+widget+footer+CTA color, marketing campaign, color fallbacks (#1A1A1A neutral / #3B82F6 slate-blue replace #FF6B35 transport-orange), property group naming, Shipperz-specific Doc branching at L1740, lead labels/sources, engagement bodies — all read from plan with industry-neutral defaults
+   - doc_generator.py: SHIPPERZ_ORANGE/SHIPPERZ_DARK constants renamed to BRAND_ACCENT_NEUTRAL (#3B82F6 slate blue) / DARK_TEXT (#111827); new `_branding_color`/`_accent_color`/`_dark_text` helpers; banner slug check generalized
+   - playwright_phases_extras.py: "Shipperz Daily Snapshot" dashboard / `pipeline = Shipperz` filter / shipping-specific stages all parameterized via `plan["playwright_dashboard"]` + manifest pipeline stages (now stored on `manifest["pipeline"]["stages"]`)
+   - references/v2-content-campaigns.md: full rewrite as generic template structure with multi-industry examples (transport, marine audio, HVAC, B2B SaaS) quarantined to a "Worked examples" section
+   - references/easter-egg-catalog.md, v2-capabilities.md, google-doc-template.md, setup-procedure.md, hubspot-api-reference.md: all Shipperz-specific examples genericized or replaced with multi-industry illustrations
+7. **Item 1** — image-gen provider chooser: orchestrator (Phase 2 Claude) tries Recraft MCP first (free tier, 30 credits/day), falls back to OpenAI gpt-image-1 or Google Gemini imagen via new `helpers/09-generate-hero.sh` (REST API). Surfaced via preflight one-liner. `HUBSPOT_DEMO_HERO_PROVIDER` env override
+8. **Item 10 (NEW)** — SKILL.md Phase 2 Quality Gate with 6 mandatory checks (no terminology reuse, persona freshness, deal-stage prospect-specificity, custom object naming, email voice-match, no phantom numbers) — prevents the kind of bleed that put "Tesla Model Y install" in Boomer's marine audio sandbox
+9. **Item 11 (NEW)** — manual-step reason hygiene: forbidden patterns ("API returned", "500", "rejected", "blocked", "validation", "INVALID_") in user-facing manual_step `reason` strings; acceptable rephrases listed
+10. **Item 12 (NEW)** — phantom-number guard in `_recommendation_text`: drops any sentence with `$<amount>` / `$<amount>K` not present in `manifest["deals"]` or `plan["deals"][*]["amount"]`. Catches the Boomer "$4,200 boat install" bug class
+11. **Item 13 (NEW)** — `verify_manifest_integrity` runs after Phase 17: checks form_submissions_count vs planned (20% tolerance), every plan contact in manifest, every plan deal in manifest
+12. **Item 14 (NEW — Jeremy's mid-Phase-3 add)** — "Time saved vs manual build" feature: new `time_estimates.py` module with per-unit minute constants; `compute_time_saved` produces total + breakdown; doc renders prominent ⏱ stat at top + breakdown table at bottom (graceful degradation if module fails)
+
+### Architecture decisions
+- Plan-schema document (`docs/punch-lists/2026-04-26-post-test-tweaks/plan-schema.md`) is the locked contract: Phase 2 (Claude orchestrator with MCP access) writes the plan, builder.py is the deterministic Python executor that consumes it. Every new field has a documented industry-neutral fallback.
+- All LLM-generated content (engagement bodies, NPS form text, marketing email body, marketing campaign metadata, hero image prompts) flows through Phase 2 → plan → builder, never inside builder.py itself
+- Image-gen MCP runs in Claude session (Phase 2); REST APIs (OpenAI/Gemini) handled by bash helper
+
+### Files touched
+- builder.py: 2330 → 2801 lines (~660 net additions)
+- doc_generator.py: ~398 net additions
+- playwright_phases_extras.py: ~212 net additions
+- All 6 reference docs: targeted edits + 1 full rewrite (v2-content-campaigns.md)
+- SKILL.md, commands/hotdog.md: Phase 2 Quality Gate + image-gen flow + verifier surfacing + Playwright bias warning
+- New: helpers/09-generate-hero.sh, time_estimates.py
+- Punch-list folder: punch-list.md, plan.md, plan-schema.md, sweep-consolidated.md, sweep-doc-and-references.md, screenshots/
+
+### Reviews (Phase 3 adversarial pass)
+- codex:rescue (Codex/GPT) — adversarial second-opinion code review
+- Opus 4.7 (independent senior-engineer review across 3 dimensions: completeness, correctness, semantic coherence)
+- Both run in parallel; critical/high findings fixed before deploy; medium/low to backlog at `docs/backlog/dod-findings.md`
+
+### Production verification path
+End-to-end run on a fresh prospect (NOT Shipperz, NOT Boomer) — needs prospect URL from Jeremy. Verifies:
+- Generated doc renders the time-saved hero stat + breakdown table
+- All contact links open the right contact (verify_doc_urls)
+- Manifest integrity passes (verify_manifest_integrity)
+- NPS form preview shows dropdown + textarea with branded button
+- Marketing email shows AI-generated hero + industry-appropriate body
+- Zero leak of "shipperz", "snowbird", "auto transport", "FF6B35" anywhere in output (greppable assertion)
+
+### Demo recording strategy
+Friday 2026-05-01. Same kickoff-then-talk strategy as v0.2.0; what's different is the deliverable now feels custom-tailored instead of templated, and the time-saved stat at the top of the doc gives the prospect a tangible "this just saved us 9 hours" moment.
+
+### v0.3.0 production verification (2026-04-26 night, on 1800LAW1010.com)
+
+End-to-end run on Harding Mazzotti / 1800LAW1010 (a consumer personal-injury law firm — totally different industry from prior runs). Took ~22 minutes. Headline: **the genericization holds**. Zero forbidden-string matches in any output. The deliverable reads as a clean PI law firm demo at every layer:
+- Pipeline: New Inquiry → Intake Scheduled → Case Review → Engagement Letter Sent → Active Representation → Settlement Negotiation → Closed-Settled / Closed-Declined
+- Custom object: `case_file` with practice_area, incident_date, claim_amount, venue_state, lead_attorney
+- Personas: Intake Coordinator, Case Manager, Senior Paralegal, Trial Attorney, prospective clients
+- Lead label: "Robert Petrov — personal injury inquiry (TV ad response)"
+- Marketing email: "$1 billion in settlements... Schedule my free consultation... 1-844-951-1464 24/7" (matches the firm's actual website CTA pattern exactly)
+- Quote catalog: contingency fee, NY court filing fees, medical records retrieval, IME coordination, expert witness retainer
+- Marketing campaign: "Harding Mazzotti: Spring 2026 Free Consultation Drive" with PI-appropriate audience
+- Time-saved hero stat: ~7h with 20 breakdown rows
+- NPS form: number(1-10) + multi_line_text + branded #112337 navy submit button
+
+Drive doc: https://docs.google.com/document/d/14FwzdZGBAoBcsFwM_Gb3LY49F5sQ91tF5w3o9nhC9sc/edit
+
+### Four bugs surfaced and fixed during verification (FIX-5)
+
+The verify caught 4 real bugs that v0.3.0 was supposed to prevent or that the fix agents introduced. All fixed before ship:
+1. **`dropdown_select` is silently rejected by HubSpot v3 Forms API.** Authoritative type list per a 400 probe: `[datepicker, dropdown, email, file, mobile_phone, multi_line_text, multiple_checkboxes, number, payment_link_radio, phone, radio, single_checkbox, single_line_text]`. Renamed to `dropdown` everywhere; auto-injects `displayOrder` per option.
+2. **Phase 15 calc-property cross-contamination via 409 path.** When `deal_age_days` already existed (from a prior Shipperz run), the POST returned 409 and the code skipped silently — leaving the property with `groupName=shipperz_demo_properties`. New `_regroup_property_to_match` helper does GET → compare → PATCH if drift detected.
+3. **Custom contact properties referenced by plan forms aren't auto-created.** New `_ensure_form_field_properties` runs before `create_forms`, walks every form's fields, and creates any non-default contact properties with the right HubSpot type mapping (dropdown→enumeration/select, multi_line_text→string/textarea, number→number/number, etc.). Wired into `Builder.run()`.
+4. **`plan["deal_pipeline"]["stages"]` shape gap.** Bare-string stages crashed builder. Plan-schema doc now explicitly documents `[{label, probability}, ...]` shape; builder.py also coerces bare strings defensively.
+
+Plus a small bonus: `manifest["output"]["doc_url"]` now persists the Drive URL (was null even when upload succeeded).

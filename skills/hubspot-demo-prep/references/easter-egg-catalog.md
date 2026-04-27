@@ -11,8 +11,10 @@ Used by the Easter egg selector. Each entry: an ICP / pain pattern paired with a
 
 ## Catalog
 
+> **About these pain patterns:** the phrases below ("no marketing team," "too many leads," etc.) are illustrative ICP signals to help match a capability to a stated pain. They are NOT a fixed taxonomy. Phase 2 should re-derive the prospect's actual signals from research and rep notes for that specific business — different industries surface these pains in very different language (a SaaS founder says "low activation," a service business says "no-shows," a B2B sales team says "stale pipeline"). Treat the wording as examples, not keys to match verbatim.
+
 ### Sales-heavy / no-marketing-team / lead-flow signal
-- **Lead scoring with custom property** — `customer_value: 10/10` — Creates a `demo_lead_score` custom number property + scoring workflow + sorted list view. Reps with no marketing team can't manually triage hundreds of leads; scoring lets them focus on hot ones first. **Highest customer value when the rep mentions: "no marketing team," "too many leads," "we lose track," "where to focus," "lead quality."**
+- **Lead scoring with custom property** — `customer_value: 10/10` — Creates a `demo_lead_score` custom number property + scoring workflow + sorted list view. Teams without dedicated marketing ops can't manually triage hundreds of inbound leads; scoring lets them focus on the hot ones first. **Highest customer value when the rep mentions: "no marketing team," "too many leads to triage," "we lose track of follow-up," "where should reps focus," "lead quality is uneven," or any equivalent across industries (e.g., "trials we never reach out to," "form fills that go cold").**
 - **Sales pipeline automation** — `customer_value: 9/10` — Auto-create deals from form fills, auto-assign to owners, auto-task creation for follow-up. Eliminates manual data entry. Strong fit when rep mentions "manual," "spreadsheets," "we forget."
 - **Email sequences (Sales Hub)** — `customer_value: 8/10` — Personalized 5-7 email outreach cadences, paused on reply. Distinct from marketing nurtures (those go to lists). Sales-rep-driven 1:1 outreach. Fit when rep is doing cold outreach without automation.
 
@@ -27,7 +29,7 @@ Used by the Easter egg selector. Each entry: an ICP / pain pattern paired with a
 - **Marketing email A/B testing** — `customer_value: 7/10` — Built-in A/B tooling for subject lines and content. Free quality boost for any marketing email program.
 
 ### B2B / enterprise / complex-sales signal
-- **Custom object for non-standard records** — `customer_value: 9/10` — e.g., for a logistics company: `Shipment` object linked to deals + contacts. Enterprise-only feature, often misunderstood. Concrete demo lands hard.
+- **Custom object for non-standard records** — `customer_value: 9/10` — e.g., for a logistics company a `Shipment` object; for a marine audio installer an `Installation Job` object; for an HVAC contractor a `Service Visit` object; for a B2B SaaS a `Workspace` or `Account` object — pick what reflects the prospect's domain and the noun their team already uses internally. Enterprise-only feature, often misunderstood. Concrete demo lands hard *because the object name matches what the prospect already says out loud*.
 - **Deal stage probability + forecasting** — `customer_value: 8/10` — Pipeline rollup with weighted probabilities. Sales leadership uses this constantly once installed.
 - **Quote-to-cash flow** — `customer_value: 7/10` — Quote → e-sign → payment all in HubSpot. Strong when rep mentions "Stripe" / "DocuSign" pain.
 
@@ -36,10 +38,10 @@ Used by the Easter egg selector. Each entry: an ICP / pain pattern paired with a
 - **Attribution reporting (multi-touch)** — `customer_value: 9/10` — Connects which marketing actions led to closed-won. Enterprise-tier feature, ROI-justifying.
 - **Lifecycle stage automation** — `customer_value: 8/10` — Contacts automatically move from Lead → MQL → SQL → Customer based on rules. Cleans the database.
 
-### Service-business / local-business / home-services signal
-- **Online booking via Meetings tool** — `customer_value: 9/10` — Public scheduler with availability + calendar sync. Often replaces Calendly/Acuity entirely.
-- **Customer portal** — `customer_value: 8/10` — Lets customers self-serve view tickets, invoices, knowledge base. CMS Hub feature.
-- **Two-way SMS via integrations** — `customer_value: 8/10` — Native (US) or via Aircall / Kixie. Critical for service-business confirmation/reminder workflows.
+### Service-business / local-business / home-services / product-sales / B2B SaaS signal
+- **Online booking via Meetings tool** — `customer_value: 9/10` — Public scheduler with availability + calendar sync. Often replaces Calendly/Acuity entirely. For service businesses: customer self-books an appointment. For product sales: prospect self-books a discovery / demo call. For B2B SaaS: trial user self-books an onboarding walkthrough.
+- **Customer portal** — `customer_value: 8/10` — Lets customers self-serve view tickets, invoices, knowledge base. CMS Hub feature. **For B2B SaaS, the customer-portal signal becomes "in-app messaging or onboarding"** — same underlying value (reduce inbound support volume + give customers a self-serve surface), different delivery channel; lean on Service Hub knowledge base + Conversations Inbox + lifecycle workflows instead of the standalone portal.
+- **Two-way SMS via integrations** — `customer_value: 8/10` — Native (US) or via Aircall / Kixie. Critical for service-business confirmation/reminder workflows; useful for product-sales abandoned-cart / restock alerts; for B2B SaaS, generally lower fit (email + in-app are higher leverage) unless the SaaS itself is SMS-adjacent.
 
 ### Generic defaults (when ICP is unclear or stated context is sparse)
 - **Lead scoring** — see above. Always near top.

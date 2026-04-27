@@ -4,9 +4,13 @@ playwright_phases_extras — v2 UI flow additions.
 Two flows that are awkward to drive via the HubSpot REST API and worth doing
 in the UI:
 
-  1. create_starter_dashboard(slug, customer_name)
-     Builds a "Shipperz Daily Snapshot" dashboard with 4-6 cards relevant to
-     a shipping-prospect "morning coffee" view. ~2 minutes of UI work.
+  1. create_starter_dashboard(slug, customer_name, ...)
+     Builds an industry-neutral "{customer_name} Daily Snapshot" dashboard
+     with 4-6 cards relevant to a sales-team "morning coffee" view. The
+     dashboard name, pipeline filter, and deal-stage filters are all read
+     from build-plan.json (`plan["playwright_dashboard"]`) with safe
+     manifest-derived fallbacks — see the function docstring for the full
+     parameterization contract. ~2 minutes of UI work.
 
   2. create_saved_views(slug)
      Creates 3 private saved views (Hot Leads / Open Quotes / Needs Reply).
@@ -49,7 +53,9 @@ verified against the live HubSpot UI as of 2026-04-26):
                  /contacts/{portal}/objects/0-1/views/all/list
                  /contacts/{portal}/objects/0-3/views/all/list
                  /contacts/{portal}/objects/0-5/views/all/list
-    - Custom Shipperz pipeline ID is read from manifest['pipeline']['id']
+    - Custom deal-pipeline ID is read from manifest['pipeline']['id']
+      (the pipeline is whatever industry-specific pipeline this prospect's
+      build-plan defined — the code never hardcodes a pipeline name)
 """
 from __future__ import annotations
 
@@ -196,6 +202,26 @@ def _fail(msg: str) -> None:
     _log(f"  PW-EXTRAS fail: {msg}")
 
 
+def _load_plan(work_dir: str) -> dict[str, Any]:
+    """
+    Load build-plan.json from {work_dir}. Returns {} on any failure (missing
+    file, malformed JSON, permission error) so callers can use
+    `plan.get(...)` patterns without guarding against None. Phase 2
+    (orchestrator) writes this file; if it's absent, downstream code should
+    fall back to manifest-derived defaults.
+    """
+    plan_path = os.path.join(work_dir, "build-plan.json")
+    if not os.path.exists(plan_path):
+        return {}
+    try:
+        with open(plan_path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:  # noqa: BLE001
+        _warn(f"_load_plan failed reading {plan_path}: {e}")
+        return {}
+
+
 def _record_manual(session: PlaywrightSession, item: str, ui_url: str,
                    instructions: str, reason: str) -> None:
     """Append a manual_step entry to the manifest (matches Builder's schema)."""
@@ -274,8 +300,34 @@ def create_starter_dashboard(slug: str, customer_name: str,
                              work_dir: str | None = None,
                              env_path: str | None = None) -> dict[str, Any]:
     """
-    Build the "Shipperz Daily Snapshot" dashboard with the prospect's
-    "morning coffee" view. Records dashboard_id + url into manifest.
+    Build an industry-neutral "{customer_name} Daily Snapshot" dashboard
+    with the prospect's "morning coffee" view. Records dashboard_id + url
+    into manifest.
+
+    Parameterization contract
+    -------------------------
+    The function reads the build-plan.json from {work_dir} (loaded via
+    `_load_plan` below) and the manifest from the active PlaywrightSession,
+    then derives three prospect-specific labels:
+
+      * dashboard_name   — from `plan["playwright_dashboard"]["name"]`
+                           Falls back to `f"{customer_name} Daily Snapshot"`.
+      * pipeline_name    — from `plan["playwright_dashboard"]["filter_pipeline_name"]`
+                           Falls back to `manifest["pipeline"]["name"]`,
+                           then to "" (filter is omitted from the saved-view
+                           filter_summary if neither is available).
+      * stage_names      — from `plan["playwright_dashboard"]["filter_stages"]`
+                           Falls back to the first 3 entries of
+                           `manifest["pipeline"].get("stages", [])`.
+                           Each entry can be a string label or a dict with a
+                           "label" key.
+
+    NONE of the HubSpot UI selectors / CSS structure changes — this
+    parameterization only affects the strings TYPED INTO HubSpot
+    (dashboard title, manual-step instructions for fallbacks, and the
+    saved-view filter_summary text downstream). The function will not
+    crash if the plan file is missing — it falls back entirely to manifest
+    values + the customer_name-derived dashboard title.
 
     Returns a small dict summary of what was created (or what was logged as
     a manual step).
@@ -284,6 +336,9 @@ def create_starter_dashboard(slug: str, customer_name: str,
     summary: dict[str, Any] = {"flow": "create_starter_dashboard",
                                "slug": slug, "customer_name": customer_name,
                                "cards_added": [], "dashboard_id": None}
+
+    # Load the build-plan so we can read playwright_dashboard overrides.
+    plan = _load_plan(work_dir)
 
     try:
         session_cm = PlaywrightSession(slug=slug, portal_id=portal_id)
@@ -298,14 +353,18 @@ def create_starter_dashboard(slug: str, customer_name: str,
             _fail("page is None — Playwright failed to launch")
             return {**summary, "error": "page-init-none"}
 
+        # Derive the prospect-specific dashboard name (industry-neutral).
+        pw_dash_cfg = (plan.get("playwright_dashboard") or {}) if isinstance(plan, dict) else {}
+        dashboard_name = pw_dash_cfg.get("name") or f"{customer_name} Daily Snapshot"
+
         dashboards_url = f"https://app.hubspot.com/reports-dashboard/{portal}/dashboards"
         manual_instructions = (
-            "Open Reports -> Dashboards, click 'Create dashboard', pick "
-            "'Sales overview' template (or 'Blank' if not offered), name it "
-            "'Shipperz Daily Snapshot', then add cards for: deal pipeline by "
-            "stage, tickets by status (last 30d), contacts created (last 90d), "
-            "marketing email opens/clicks, and shipperz_quote_requested "
-            "events over time."
+            f"Open Reports -> Dashboards, click 'Create dashboard', pick "
+            f"'Sales overview' template (or 'Blank' if not offered), name it "
+            f"'{dashboard_name}', then add cards for: deal pipeline by "
+            f"stage, tickets by status (last 30d), contacts created (last 90d), "
+            f"marketing email opens/clicks, and a custom-event volume report "
+            f"over time."
         )
 
         # ---- Navigate ----
@@ -372,15 +431,15 @@ def create_starter_dashboard(slug: str, customer_name: str,
                        manual_instructions):
                 # GUESSED: HubSpot sometimes prompts inline, sometimes via modal.
                 try:
-                    _fill_label(session, "Dashboard name", "Shipperz Daily Snapshot",
+                    _fill_label(session, "Dashboard name", dashboard_name,
                                 timeout_ms=5_000)
                 except Exception:
                     try:
-                        _fill_label(session, "Name", "Shipperz Daily Snapshot",
+                        _fill_label(session, "Name", dashboard_name,
                                     timeout_ms=5_000)
                     except Exception:
                         # Fallback: edit the title in the header.
-                        page.keyboard.type("Shipperz Daily Snapshot")
+                        page.keyboard.type(dashboard_name)
                 # Confirm.
                 for label in ("Save", "Create", "Done"):
                     try:
@@ -406,10 +465,27 @@ def create_starter_dashboard(slug: str, customer_name: str,
             pass
 
         # ---- Add cards ----
-        pipeline_id = (session.manifest.get("pipeline") or {}).get("id", "")
+        manifest_pipeline = session.manifest.get("pipeline") or {}
+        pipeline_id = manifest_pipeline.get("id", "")
+        # Pipeline label for manual-step instructions: plan override wins,
+        # then manifest, then a neutral generic phrase.
+        pipeline_label = (
+            pw_dash_cfg.get("filter_pipeline_name")
+            or manifest_pipeline.get("name")
+            or "the prospect's deal pipeline"
+        )
+        # Custom-event name for the last card. Try the first key in
+        # manifest['custom_events'] (industry-specific name set by builder),
+        # otherwise fall back to a generic label.
+        custom_events = session.manifest.get("custom_events") or {}
+        if isinstance(custom_events, dict) and custom_events:
+            custom_event_name = next(iter(custom_events.keys()))
+        else:
+            custom_event_name = "the prospect's primary custom event"
+
         cards_to_add = [
             ("Deal pipeline by stage",
-             "Pipelines -> select Shipperz pipeline" + (f" ({pipeline_id})" if pipeline_id else ""),
+             f"Pipelines -> select '{pipeline_label}'" + (f" ({pipeline_id})" if pipeline_id else ""),
              "deal_pipeline_by_stage"),
             ("Tickets by status (last 30 days)",
              "Tickets -> Status -> last 30 days", "tickets_by_status"),
@@ -419,9 +495,9 @@ def create_starter_dashboard(slug: str, customer_name: str,
              "Marketing -> Email opens / clicks", "email_performance"),
             ("NPS score distribution",
              "Custom report -> NPS property -> bar chart", "nps_distribution"),
-            ("Quote-request event volume",
-             "Custom report -> shipperz_quote_requested over time",
-             "quote_request_events"),
+            ("Custom-event volume",
+             f"Custom report -> {custom_event_name} over time",
+             "custom_event_volume"),
         ]
 
         for idx, (card_label, library_hint, card_key) in enumerate(cards_to_add, start=1):
@@ -518,10 +594,15 @@ _SAVED_VIEWS: list[dict[str, Any]] = [
         "object": "deals",
         "object_id": "0-3",
         "url_segment": "contacts",  # HubSpot deals list lives under /contacts/{portal}/objects/0-3/
-        "filter_summary": "pipeline = Shipperz AND stage in (Quote Requested, Quote Sent, Negotiating)",
+        # filter_summary + filter_value are populated at runtime in
+        # create_saved_views() from plan["playwright_dashboard"] + manifest.
+        # The literals below are neutral placeholders; the real, prospect-
+        # specific pipeline name and deal-stage labels are substituted in
+        # before this view is used.
+        "filter_summary": "pipeline = <prospect pipeline> AND stage in (<early stages>)",
         "filter_property": "dealstage",
         "filter_operator": "is any of",
-        "filter_value": "Quote Requested|Quote Sent|Negotiating",
+        "filter_value": "",
         "sort_property": "amount",
         "sort_descending": True,
     },
@@ -541,15 +622,96 @@ _SAVED_VIEWS: list[dict[str, Any]] = [
 ]
 
 
+def _resolve_saved_views(plan: dict[str, Any],
+                         manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return a per-call copy of `_SAVED_VIEWS` with the open_quotes view's
+    pipeline name and deal-stage labels resolved from plan + manifest.
+
+    Resolution order:
+      pipeline name → plan["playwright_dashboard"]["filter_pipeline_name"]
+                    → manifest["pipeline"]["name"]
+                    → "the prospect's deal pipeline" (last-resort label)
+      stage labels  → plan["playwright_dashboard"]["filter_stages"]
+                    → first 3 entries of manifest["pipeline"]["stages"]
+                    → [] (filter falls back to a no-op stage placeholder)
+
+    The selectors / object_id / sort_property fields are unchanged — only
+    the human-visible filter_summary and the typed-in filter_value chips
+    are parameterized.
+    """
+    pw_dash_cfg = (plan.get("playwright_dashboard") or {}) if isinstance(plan, dict) else {}
+    manifest_pipeline = manifest.get("pipeline") or {}
+
+    pipeline_name = (
+        pw_dash_cfg.get("filter_pipeline_name")
+        or manifest_pipeline.get("name")
+        or "the prospect's deal pipeline"
+    )
+
+    raw_stages = pw_dash_cfg.get("filter_stages")
+    if not raw_stages:
+        raw_stages = (manifest_pipeline.get("stages") or [])[:3]
+
+    # Normalize: each entry may be a string or a dict with a "label" key.
+    stage_labels: list[str] = []
+    for s in raw_stages:
+        if isinstance(s, str):
+            label = s.strip()
+        elif isinstance(s, dict):
+            label = str(s.get("label") or s.get("name") or "").strip()
+        else:
+            label = ""
+        if label:
+            stage_labels.append(label)
+
+    # Build a fresh list — never mutate the module-level template.
+    resolved: list[dict[str, Any]] = []
+    for view in _SAVED_VIEWS:
+        v = dict(view)
+        if v.get("key") == "open_quotes":
+            if stage_labels:
+                stage_summary = ", ".join(stage_labels)
+                v["filter_summary"] = (
+                    f"pipeline = {pipeline_name} AND "
+                    f"stage in ({stage_summary})"
+                )
+                # HubSpot's "is any of" multi-value filter uses pipe-split
+                # chips — preserve that contract.
+                v["filter_value"] = "|".join(stage_labels)
+            else:
+                # No stages available — leave the filter open, just note
+                # the pipeline in the summary so the manual-step prompt
+                # is still readable.
+                v["filter_summary"] = (
+                    f"pipeline = {pipeline_name} (no stage filter — "
+                    f"no stage labels available in plan or manifest)"
+                )
+                v["filter_value"] = ""
+        resolved.append(v)
+    return resolved
+
+
 def create_saved_views(slug: str, portal_id: str, work_dir: str | None = None,
                        env_path: str | None = None) -> dict[str, Any]:
     """
     Create the three private saved views. Records {key: {id, url}} into
     manifest['saved_views'].
+
+    The "Open Quotes" view is parameterized per-prospect. The pipeline
+    name and stage labels are read from build-plan.json
+    (`plan["playwright_dashboard"]["filter_pipeline_name"]` /
+    `plan["playwright_dashboard"]["filter_stages"]`) and fall back to
+    `manifest["pipeline"]["name"]` and the first 3 entries of
+    `manifest["pipeline"].get("stages", [])` respectively. Stage entries
+    can be either string labels or dicts with a "label" key (the latter
+    matches the deal_pipeline shape in build-plan.json).
     """
     work_dir = work_dir or f"/tmp/demo-prep-{slug}"
     summary: dict[str, Any] = {"flow": "create_saved_views", "slug": slug,
                                "views": {}}
+
+    plan = _load_plan(work_dir)
 
     try:
         session_cm = PlaywrightSession(slug=slug, portal_id=portal_id)
@@ -567,7 +729,11 @@ def create_saved_views(slug: str, portal_id: str, work_dir: str | None = None,
         if "saved_views" not in session.manifest:
             session.manifest["saved_views"] = {}
 
-        for view in _SAVED_VIEWS:
+        # Build a per-call copy of the view templates and patch the
+        # open_quotes view with prospect-specific pipeline + stage labels.
+        views_for_this_run = _resolve_saved_views(plan, session.manifest)
+
+        for view in views_for_this_run:
             list_url = (
                 f"https://app.hubspot.com/{view['url_segment']}/{portal}/"
                 f"objects/{view['object_id']}/views/all/list"

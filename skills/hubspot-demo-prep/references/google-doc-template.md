@@ -6,7 +6,7 @@ The skill produces one Google Doc per demo prep run. Below is the canonical stru
 
 `HubSpot Demo Prep — <CompanyName> — <YYYY-MM-DD>`
 
-Example: `HubSpot Demo Prep — Shipperzinc — 2026-04-26`
+Example: `HubSpot Demo Prep — {CustomerName} — {Date}` (e.g., `HubSpot Demo Prep — Acme Corp — 2026-04-26`)
 
 ## Drive folder
 

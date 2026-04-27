@@ -1,7 +1,7 @@
 {
   "name": "hubspot-demo-prep",
   "description": "Generate a tailored, live-feeling HubSpot demo environment for a specific customer in minutes. Researches the prospect, builds an ICP-realistic CRM dataset, generates branded marketing assets, configures workflows, and produces a polished demo runbook.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Jeremy Sagaille"
   },

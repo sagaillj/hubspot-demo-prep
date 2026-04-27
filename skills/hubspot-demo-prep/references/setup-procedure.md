@@ -1,6 +1,6 @@
 # HubSpot Demo Prep — Verified Setup Procedure
 
-This is the canonical, validated-end-to-end sequence the wizard follows. Every gotcha encountered during the original build (2026-04-25/26 on portal 20708362) is documented here so subsequent users skip the same trial-and-error.
+This is the canonical, validated-end-to-end sequence the wizard follows. Every gotcha encountered during the original build is documented here so subsequent users skip the same trial-and-error. Portal IDs cited below (e.g. `20708362`, `51393541`) are illustrative examples from the original development environment — the wizard reads your own portal IDs from `state/config.json` after the first run; nothing is hardcoded to the original portal.
 
 ## Prerequisites — automatically detected, never asked
 
@@ -166,21 +166,29 @@ state persists across flows.
 
 #### `create_starter_dashboard(slug, customer_name)`
 
-Builds the "Shipperz Daily Snapshot" dashboard a prospect would actually look
-at over morning coffee. Adds 4-6 cards (deal pipeline by stage on the custom
-Shipperz pipeline, tickets by status last 30 days, contacts created last 90
-days, marketing email opens/clicks, NPS distribution if data exists, and
-`shipperz_quote_requested` custom event volume). Prefers HubSpot's report
-library where possible. Stores `dashboard_id` and `dashboard_url` in
-`manifest.json`. Longest UI flow in the build (~2 minutes).
+Builds a "{CustomerName} Daily Snapshot" dashboard the prospect would actually
+look at over morning coffee. Adds 4-6 cards (deal pipeline by stage on the
+prospect's custom pipeline, tickets by status last 30 days, contacts created
+last 90 days, marketing email opens/clicks, NPS distribution if data exists,
+and a `{customer}_{key_action}_event` custom event volume card — for example
+`shipperz_quote_requested` for a logistics prospect, `boomer_install_booked`
+for a marine audio installer, `acme_trial_started` for a B2B SaaS). The
+custom-object name shown elsewhere in this doc (e.g., `shipmentsobject`) is
+likewise just one example — the actual object name should reflect the
+prospect's domain (`installations`, `service_visits`, `workspaces`, etc.).
+Prefers HubSpot's report library where possible. Stores `dashboard_id` and
+`dashboard_url` in `manifest.json`. Longest UI flow in the build (~2 minutes).
 
 #### `create_saved_views(slug)`
 
 Creates three private saved views — fast (~30s each):
 
 - **Contacts: Hot Leads** — `demo_lead_score >= 50`, sorted by score desc.
-- **Deals: Open Quotes** — Shipperz pipeline, stage in `(Quote Requested,
-  Quote Sent, Negotiating)`, sorted by amount desc.
+- **Deals: Open Quotes** — prospect's custom pipeline, stage in the
+  prospect's equivalent of `(Quote Requested, Quote Sent, Negotiating)`
+  (stage names should match the actual sales motion — for a service
+  business that may be `(Estimate Sent, Site Visit Booked)`; for B2B SaaS
+  `(Demo Done, POC Active, Procurement)`), sorted by amount desc.
 - **Tickets: Needs Reply** — `hs_pipeline_stage` in `(New, Waiting on contact)`,
   sorted by createdate asc.
 

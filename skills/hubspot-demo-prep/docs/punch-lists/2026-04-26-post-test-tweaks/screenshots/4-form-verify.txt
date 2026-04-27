@@ -1,0 +1,23 @@
+=== Item 4 verification — GET each Boomer form GUID ===
+
+--- Form a963651a-742d-4bab-b33e-24f3d3b69153 ---
+HTTP 200
+name: Post-Install NPS Survey (Demo)
+archived: False
+fieldGroups: 1
+fields: 3
+
+--- Form 3d4c9acf-c833-4d44-bbce-2cf97e865fde ---
+HTTP 200
+name: Free On-Site Marine Consultation (Demo)
+archived: False
+fieldGroups: 2
+fields: 4
+
+--- Form a62cddd1-9a1f-4436-a052-3d64a6e2b83f ---
+HTTP 200
+name: Remote Starter Quote (Demo)
+archived: False
+fieldGroups: 2
+fields: 4
+

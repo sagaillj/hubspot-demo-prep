@@ -17,6 +17,7 @@ includes AI-generated hero image via Recraft (when available).
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -172,6 +173,61 @@ def ok(msg: str) -> None:    log(f"  ✓ {msg}")
 def warn(msg: str) -> None:  log(f"  ⚠ {msg}")
 def fail(msg: str) -> None:  log(f"  ✗ {msg}")
 
+
+# ---- Manual-step reason hygiene ----
+#
+# `add_manual_step` reasons render in the prospect-facing demo doc. Raw API
+# strings ("API returned 500", "v4 flows API rejected actions", "Forms API
+# rejected", "INVALID_OPTION", etc.) make us look broken to the buyer.
+# `_sanitize_reason` rewrites any raw-error reason into professional rationale
+# the rep can defend in the room. The original string is preserved on the
+# manual_step entry under `internal_reason` for debugging.
+
+# Tokens that indicate a raw API error leaked into the reason field. Lowercase
+# match — see `_sanitize_reason`. Sourced from SKILL.md Phase 3.
+FORBIDDEN_REASON_TOKENS = (
+    "api returned", "500", "rejected", "blocked", "validation",
+    "invalid_", "401", "403", "429", "v4 flows", "forms api",
+)
+
+# Map manual-step item keywords to a polished public-facing reason. Order
+# matters — "workflow" is checked before "email" so a manual step like
+# "Add send_email action to '<workflow name>'" maps to the workflow phrase,
+# not the email phrase.
+_REASON_REPHRASE = (
+    ("workflow", "Built manually for finer control over branching/timing"),
+    ("quote",    "Built in UI for richer template handling"),
+    ("invoice",  "Built in UI for richer template handling"),
+    ("campaign", "Built in UI for finer control"),
+    ("form",     "Configured by hand for advanced field validation"),
+    ("email",    "Configured by hand for advanced field validation"),
+)
+
+
+def _sanitize_reason(raw_reason: str | None, item_label: str = "") -> str:
+    """Return a public-safe rephrase if `raw_reason` contains any forbidden
+    API-error token; otherwise return it unchanged. `item_label` lets us pick
+    a domain-appropriate fallback (workflow → branching, form → validation, etc).
+
+    The match is also raw-reason-aware: a reason mentioning "v4 flows" forces
+    the workflow phrasing even when the item label is ambiguous (e.g. a gap
+    step like "Add send_email action to '<workflow name>'").
+    """
+    raw = (raw_reason or "").strip()
+    low = raw.lower()
+    if not any(tok in low for tok in FORBIDDEN_REASON_TOKENS):
+        return raw
+    item_low = (item_label or "").lower()
+    # Hint the workflow phrasing for any step whose RAW reason mentioned
+    # workflow / v4 flows / branching, even when the item label says "email".
+    if "v4 flows" in low or "workflow" in low or "workflow" in item_low:
+        return _REASON_REPHRASE[0][1]  # workflow phrasing
+    # Otherwise fall back to whichever marker first matches the item label.
+    for marker, rephrase in _REASON_REPHRASE:
+        if marker in item_low:
+            return rephrase
+    return "Built in UI for finer control"
+
 # ---- HTTP client ----
 
 class HubSpotClient:
@@ -298,9 +354,15 @@ class Builder:
         return int((time.time() - days * 86400) * 1000)
 
     def add_manual_step(self, item: str, ui_url: str, instructions: str, reason: str) -> None:
+        # Public `reason` is sanitized (no raw API errors leak to the prospect).
+        # Original raw reason stays on `internal_reason` so the rep + post-mortem
+        # tooling still see the actual API status / message.
+        public_reason = _sanitize_reason(reason, item_label=item)
         self.manifest["manual_steps"].append({
             "item": item, "ui_url": ui_url,
-            "instructions": instructions, "reason": reason,
+            "instructions": instructions,
+            "reason": public_reason,
+            "internal_reason": reason or "",
         })
 
     def add_error(self, where: str, status: int, body: Any) -> None:
@@ -431,7 +493,14 @@ class Builder:
         company_id = self.manifest["company"]["id"]
         # HubSpot rejects .test TLD; rewrite to RFC-2606 reserved example.com prefix
         # so the demo never collides with a real registered domain.
+        # We also persist `original -> rewritten` in self._email_rewrite_map
+        # because activity_content.per_contact_engagements is keyed by the
+        # ORIGINAL email (orchestrator-supplied) but the manifest is keyed by
+        # the REWRITTEN one. The engagement lookup checks both.
+        if not hasattr(self, "_email_rewrite_map"):
+            self._email_rewrite_map: dict[str, str] = {}
         for c in self.plan["contacts"]:
+            original_email = c["email"]
             # .test is reserved per RFC 2606 but HubSpot rejects it.
             # Use the slug-prefixed example.com to avoid colliding with a real domain.
             if c["email"].endswith(".test"):
@@ -443,6 +512,8 @@ class Builder:
                     c["email"] = c["email"].replace(
                         f"@demo-{self.slug}.@demo-{self.slug}.", f"@demo-{self.slug}."
                     )
+            if original_email != c["email"]:
+                self._email_rewrite_map[original_email] = c["email"]
 
         # Per-contact create (avoids batch 207 partial-failure ambiguity)
         for c in self.plan["contacts"]:
@@ -479,6 +550,24 @@ class Builder:
     def create_pipeline_and_deals(self) -> None:
         log("Phase 4: Pipeline + deals")
         pipeline_plan = self.plan["deal_pipeline"]
+
+        # Defensive coercion: plan stages should be `[{label, probability}, ...]`
+        # but older or hand-written plans sometimes pass bare strings. Coerce so
+        # the builder doesn't crash with `TypeError: string indices must be
+        # integers` when indexing s["label"] below. The schema doc at
+        # docs/punch-lists/.../plan-schema.md is authoritative — see fix #4.
+        raw_stages = pipeline_plan.get("stages") or []
+        coerced_stages = []
+        for i, st in enumerate(raw_stages):
+            if isinstance(st, str):
+                warn(f"Phase 4: pipeline stage {i} is a bare string ({st!r}); "
+                     f"coercing to {{label: ..., probability: 0.5}}. Plan should "
+                     f"emit objects per plan-schema.md.")
+                coerced_stages.append({"label": st, "probability": 0.5})
+            else:
+                coerced_stages.append(st)
+        pipeline_plan["stages"] = coerced_stages
+
         # Check for existing pipeline by label
         s, r = self.client.request("GET", "/crm/v3/pipelines/deals")
         existing_id = None
@@ -502,14 +591,17 @@ class Builder:
             pipeline_id = r["id"]
             ok(f"pipeline {pipeline_plan['name']} → {pipeline_id}")
 
+        # Fetch the pipeline so we have authoritative stage labels (stage map +
+        # the playwright dashboard's "open quotes" filter both consume this).
+        s, r = self.client.request("GET", f"/crm/v3/pipelines/deals/{pipeline_id}")
+        stages_list = [{"label": st["label"], "id": st["id"]} for st in r.get("stages", [])]
+        stage_map = {st["label"]: st["id"] for st in r.get("stages", [])}
+
         self.manifest["pipeline"] = {
             "id": pipeline_id, "name": pipeline_plan["name"],
             "url": f"https://app.hubspot.com/sales/{self.portal}/deals/board/view/all/?pipeline={pipeline_id}",
+            "stages": stages_list,  # [{label, id}] — read by playwright_phases_extras saved-views builder
         }
-
-        # Stage map
-        s, r = self.client.request("GET", f"/crm/v3/pipelines/deals/{pipeline_id}")
-        stage_map = {st["label"]: st["id"] for st in r.get("stages", [])}
 
         # Deals (sequential to avoid race on associations)
         company_id = self.manifest["company"]["id"]
@@ -579,41 +671,155 @@ class Builder:
         }.get(level, (3, 2, 2, 1, 4))
         n_notes, n_tasks, n_calls, n_meetings, n_emails = counts
 
-        notes = self.plan.get("activity_content", {}).get("notes", []) or [
+        # Pools: pull from plan["activity_content"]; fall back to industry-NEUTRAL
+        # defaults from plan-schema.md. Notes are strings; tasks are strings;
+        # calls/meetings/emails are objects ({title|subject, body}).
+        ac = self.plan.get("activity_content", {}) or {}
+        notes_pool = ac.get("notes_pool") or ac.get("notes") or [
             "Touchpoint with prospect.",
             "Discovery call notes.",
             "Follow-up email summary.",
         ]
-        tasks = ["Follow up on pricing", "Send case studies", "Schedule technical deep-dive",
-                 "Review contract", "Draft proposal"]
-        calls = ["Discovery call", "Demo follow-up", "Pricing discussion", "Technical questions"]
-        meetings = ["Demo session", "QBR", "Solutioning workshop"]
-        emails = ["Re: Following up", "Quick question", "Demo recap + next steps", "Pricing breakdown"]
+        tasks_pool = ac.get("tasks_pool") or [
+            "Follow up on pricing", "Send case studies",
+            "Schedule technical deep-dive", "Review contract", "Draft proposal",
+        ]
+        calls_pool = ac.get("calls_pool") or [
+            {"title": "Discovery call", "body": "Discussed needs."},
+            {"title": "Pricing discussion", "body": "Walked through pricing."},
+        ]
+        meetings_pool = ac.get("meetings_pool") or [
+            {"title": "Demo session", "body": "Walked through capabilities."},
+        ]
+        emails_pool = ac.get("emails_pool") or [
+            {"subject": "Re: Following up", "body": "Following up on our conversation."},
+        ]
+
+        # Per-contact engagements (preferred path). Keyed by email or contact id.
+        per_contact_map = ac.get("per_contact_engagements") or {}
 
         # Pre-generate engagement payloads. Every engagement is tagged
         # demo_customer=<slug> so cleanup's search-by-property loop finds them.
         tag = {"demo_customer": self.slug}
         payloads: list[tuple[str, dict]] = []
-        for cid in self.manifest["contacts"].values():
+
+        def _pool_obj(pool: list, key_title: str) -> dict:
+            """Pull one entry from a pool of {title|subject, body} objects.
+            Tolerates string entries by promoting them to {key_title: str, body: ''}.
+            """
+            choice = random.choice(pool)
+            if isinstance(choice, str):
+                return {key_title: choice, "body": ""}
+            return choice
+
+        def _build_explicit_payload(eng: dict, cid: str, ts_default: int) -> tuple[str, dict] | None:
+            """Build a single payload from a per-contact engagement entry.
+            eng schema: {type, body, optional title|subject, optional duration_ms,
+                         optional ts_offset_days}.
+            """
+            etype = (eng.get("type") or "").lower()
+            offset = eng.get("ts_offset_days")
+            ts = self.ms_ago(int(offset)) if offset is not None else ts_default
+            body_text = eng.get("body", "")
+            if etype == "note":
+                return ("/crm/v3/objects/notes", {
+                    "properties": {"hs_note_body": body_text, "hs_timestamp": ts, **tag},
+                    "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["note_to_contact"]}]}],
+                })
+            if etype == "task":
+                return ("/crm/v3/objects/tasks", {
+                    "properties": {
+                        "hs_task_subject": eng.get("title") or eng.get("subject") or body_text[:80] or "Task",
+                        "hs_task_body": body_text,
+                        "hs_task_status": "COMPLETED",
+                        "hs_task_priority": "MEDIUM",
+                        "hs_timestamp": ts, **tag,
+                    },
+                    "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["task_to_contact"]}]}],
+                })
+            if etype == "call":
+                return ("/crm/v3/objects/calls", {
+                    "properties": {
+                        "hs_call_title": eng.get("title") or "Call",
+                        "hs_call_body": body_text,
+                        "hs_call_duration": int(eng.get("duration_ms") or random.randint(600000, 1800000)),
+                        "hs_call_direction": "OUTBOUND",
+                        "hs_call_status": "COMPLETED",
+                        "hs_timestamp": ts, **tag,
+                    },
+                    "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["call_to_contact"]}]}],
+                })
+            if etype == "meeting":
+                duration = int(eng.get("duration_ms") or 1800000)
+                return ("/crm/v3/objects/meetings", {
+                    "properties": {
+                        "hs_meeting_title": eng.get("title") or "Meeting",
+                        "hs_meeting_body": body_text,
+                        "hs_meeting_start_time": ts,
+                        "hs_meeting_end_time": ts + duration,
+                        "hs_meeting_outcome": "COMPLETED",
+                        "hs_timestamp": ts, **tag,
+                    },
+                    "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["meeting_to_contact"]}]}],
+                })
+            if etype == "email":
+                return ("/crm/v3/objects/emails", {
+                    "properties": {
+                        "hs_email_subject": eng.get("subject") or eng.get("title") or "Email",
+                        "hs_email_text": body_text,
+                        "hs_email_direction": eng.get("direction")
+                            or random.choice(["INCOMING_EMAIL", "EMAIL"]),
+                        "hs_email_status": "SENT",
+                        "hs_timestamp": ts, **tag,
+                    },
+                    "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["email_to_contact"]}]}],
+                })
+            return None
+
+        # Reverse map: rewritten -> original. Used so per_contact_engagements
+        # keys (which Phase 2 wrote against the original email) still match
+        # after create_contacts rewrote .test addresses.
+        rewrite_reverse = {v: k for k, v in getattr(self, "_email_rewrite_map", {}).items()}
+
+        for email, cid in self.manifest["contacts"].items():
+            # Per-contact override path: try keyed by current email, original
+            # (pre-rewrite) email, or by contact id as a string. Belt-and-
+            # suspenders so both orchestrator-supplied keying schemes work.
+            original_email = rewrite_reverse.get(email)
+            entries = (
+                per_contact_map.get(email)
+                or (per_contact_map.get(original_email) if original_email else None)
+                or per_contact_map.get(str(cid))
+            )
+            if entries:
+                ts_default = self.ms_ago(random.randint(1, days_back))
+                for eng in entries:
+                    built = _build_explicit_payload(eng, cid, ts_default)
+                    if built:
+                        payloads.append(built)
+                continue
+
+            # Pool-based path
             for _ in range(n_notes):
                 ts = self.ms_ago(random.randint(1, days_back))
                 payloads.append(("/crm/v3/objects/notes", {
-                    "properties": {"hs_note_body": random.choice(notes), "hs_timestamp": ts, **tag},
+                    "properties": {"hs_note_body": random.choice(notes_pool), "hs_timestamp": ts, **tag},
                     "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["note_to_contact"]}]}],
                 }))
             for _ in range(n_tasks):
                 ts = self.ms_ago(random.randint(1, days_back))
                 payloads.append(("/crm/v3/objects/tasks", {
-                    "properties": {"hs_task_subject": random.choice(tasks),
+                    "properties": {"hs_task_subject": random.choice(tasks_pool),
                                    "hs_task_status": "COMPLETED", "hs_task_priority": "MEDIUM",
                                    "hs_timestamp": ts, **tag},
                     "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["task_to_contact"]}]}],
                 }))
             for _ in range(n_calls):
                 ts = self.ms_ago(random.randint(1, days_back))
+                call = _pool_obj(calls_pool, "title")
                 payloads.append(("/crm/v3/objects/calls", {
-                    "properties": {"hs_call_title": random.choice(calls),
-                                   "hs_call_body": "Productive conversation. Next steps confirmed.",
+                    "properties": {"hs_call_title": call.get("title", "Call"),
+                                   "hs_call_body": call.get("body", ""),
                                    "hs_call_duration": random.randint(600000, 1800000),
                                    "hs_call_direction": "OUTBOUND", "hs_call_status": "COMPLETED",
                                    "hs_timestamp": ts, **tag},
@@ -621,9 +827,10 @@ class Builder:
                 }))
             for _ in range(n_meetings):
                 start = self.ms_ago(random.randint(1, days_back))
+                meeting = _pool_obj(meetings_pool, "title")
                 payloads.append(("/crm/v3/objects/meetings", {
-                    "properties": {"hs_meeting_title": random.choice(meetings),
-                                   "hs_meeting_body": "30-minute working session.",
+                    "properties": {"hs_meeting_title": meeting.get("title", "Meeting"),
+                                   "hs_meeting_body": meeting.get("body", ""),
                                    "hs_meeting_start_time": start,
                                    "hs_meeting_end_time": start + 1800000,
                                    "hs_meeting_outcome": "COMPLETED", "hs_timestamp": start, **tag},
@@ -632,9 +839,10 @@ class Builder:
             for _ in range(n_emails):
                 ts = self.ms_ago(random.randint(1, days_back))
                 direction = random.choice(["INCOMING_EMAIL", "EMAIL"])
+                em = _pool_obj(emails_pool, "subject")
                 payloads.append(("/crm/v3/objects/emails", {
-                    "properties": {"hs_email_subject": random.choice(emails),
-                                   "hs_email_text": "Email between rep and contact.",
+                    "properties": {"hs_email_subject": em.get("subject") or em.get("title") or "Email",
+                                   "hs_email_text": em.get("body", ""),
                                    "hs_email_direction": direction,
                                    "hs_email_status": "SENT", "hs_timestamp": ts, **tag},
                     "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": ASSOC["email_to_contact"]}]}],
@@ -764,9 +972,179 @@ class Builder:
         with ThreadPoolExecutor(max_workers=4) as ex:
             futures = [ex.submit(self.client.request, "POST", "/events/v3/send", body) for body in sends]
             fires = sum(1 for f in as_completed(futures) if self.client.is_ok(f.result()[0]))
+        # Persist for time_estimates: lets the post-run estimator weigh in fires
+        # even though there's no GET endpoint to recover this count later.
+        self.manifest["custom_events_fired_count"] = (
+            int(self.manifest.get("custom_events_fired_count") or 0) + fires
+        )
         ok(f"event fires: {fires}/{len(sends)}")
 
     # ---- Phase 8: Forms ----
+
+    # Default HubSpot contact properties — never auto-created. Anything outside
+    # this set that a plan references in `plan["forms"][i]["fields"]` must be
+    # pre-created on the contacts object, otherwise the form POST 400s with a
+    # generic "internal error" (verified on 1800LAW1010 production run
+    # 2026-04-27 — `practice_area`, `nps_score`, `nps_feedback` all hit this).
+    HUBSPOT_DEFAULT_CONTACT_PROPS = frozenset({
+        "email", "firstname", "lastname", "phone", "mobilephone", "fax",
+        "website", "company", "jobtitle",
+    })
+
+    def _ensure_form_field_properties(self) -> None:
+        """Pre-flight check that runs BEFORE create_forms (Phase 8).
+
+        Walks every `plan["forms"][i]["fields"]` entry and ensures any field
+        whose name isn't a default HubSpot contact property exists on the
+        contacts object. If it doesn't exist, creates it with the right
+        HubSpot property type derived from the form field's type. If it exists
+        but is in the wrong group (cross-prospect contamination from a prior
+        run), PATCHes the groupName to match the current prospect's group.
+
+        Uses the same group-naming convention as Phase 15
+        (`property_group.name` from plan, or `f"{slug}_demo_properties"`).
+
+        Failures degrade gracefully: a manual_step is added rather than
+        crashing the build, so the rep can pre-create the property by hand
+        and re-run.
+        """
+        forms = self.plan.get("forms") or []
+        if not forms:
+            return
+        log("Phase 8 pre-flight: ensure form field properties exist on contacts")
+
+        # Match Phase 15's group-naming convention.
+        company_label = (self.manifest.get("company") or {}).get("name") or self.slug
+        pg = self.plan.get("property_group", {}) or {}
+        group_name = pg.get("name", f"{self.slug}_demo_properties")
+        group_label = pg.get("label", f"Demo ({company_label})")
+
+        # Ensure the property group exists on the CONTACTS object too. Phase 15
+        # only creates it on deals; forms reference contact properties.
+        gbody = {"name": group_name, "label": group_label, "displayOrder": 1}
+        sg, rg = self.client.request("POST",
+                                     "/crm/v3/properties/contacts/groups", gbody)
+        if sg == 409:
+            ok(f"  contact property group {group_name} already exists")
+        elif self.client.is_ok(sg):
+            ok(f"  contact property group {group_name} created")
+        else:
+            warn(f"  contact property group: {sg} {str(rg)[:200]}")
+            # Don't bail — POST property below may still succeed in default group.
+
+        # Collect unique non-default field names referenced across all forms.
+        seen: dict[str, dict] = {}  # name -> first field dict that referenced it
+        for fp in forms:
+            for fld in fp.get("fields", []):
+                fname = fld.get("name")
+                if not fname:
+                    continue
+                if fname in self.HUBSPOT_DEFAULT_CONTACT_PROPS:
+                    continue
+                if fname not in seen:
+                    seen[fname] = fld
+
+        if not seen:
+            ok("  no custom form-field properties to ensure")
+            return
+
+        for fname, fld in seen.items():
+            # Check if it already exists.
+            sx, rx = self.client.request(
+                "GET", f"/crm/v3/properties/contacts/{fname}")
+            if self.client.is_ok(sx):
+                # Already exists. PATCH groupName if it doesn't match
+                # (cross-prospect contamination protection — same pattern as
+                # fix #2 for deal_age_days).
+                self._regroup_property_to_match("contacts", fname, group_name)
+                continue
+            if sx not in (404,):
+                warn(f"  GET contacts.{fname}: {sx} {str(rx)[:200]}")
+
+            # Doesn't exist → create. Map form field_type → HubSpot property type.
+            declared = (fld.get("field_type") or "single_line_text").lower()
+            if declared == "dropdown":
+                opts = fld.get("options") or []
+                norm_opts = []
+                for idx, o in enumerate(opts):
+                    if isinstance(o, dict):
+                        norm_opts.append({
+                            "label": str(o.get("label", o.get("value", ""))),
+                            "value": str(o.get("value", o.get("label", ""))),
+                            "displayOrder": idx + 1,
+                        })
+                    else:
+                        norm_opts.append({
+                            "label": str(o), "value": str(o),
+                            "displayOrder": idx + 1,
+                        })
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "enumeration", "fieldType": "select",
+                    "groupName": group_name, "options": norm_opts,
+                    "description": f"Demo property for {fname}.",
+                }
+            elif declared == "multi_line_text":
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "string", "fieldType": "textarea",
+                    "groupName": group_name,
+                    "description": f"Demo property for {fname}.",
+                }
+            elif declared == "number":
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "number", "fieldType": "number",
+                    "groupName": group_name,
+                    "description": f"Demo property for {fname}.",
+                }
+            elif declared == "datepicker":
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "date", "fieldType": "date",
+                    "groupName": group_name,
+                    "description": f"Demo property for {fname}.",
+                }
+            elif declared == "single_checkbox":
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "bool", "fieldType": "booleancheckbox",
+                    "groupName": group_name,
+                    "options": [
+                        {"label": "Yes", "value": "true", "displayOrder": 1},
+                        {"label": "No",  "value": "false", "displayOrder": 2},
+                    ],
+                    "description": f"Demo property for {fname}.",
+                }
+            else:
+                # single_line_text, email, phone, mobile_phone, file, radio,
+                # multiple_checkboxes — fall back to a string text property.
+                # The HubSpot built-in `email` property already exists so this
+                # branch shouldn't fire for `email` itself.
+                prop_body = {
+                    "name": fname, "label": fld.get("label", fname),
+                    "type": "string", "fieldType": "text",
+                    "groupName": group_name,
+                    "description": f"Demo property for {fname}.",
+                }
+
+            sc, rc = self.client.request(
+                "POST", "/crm/v3/properties/contacts", prop_body)
+            if self.client.is_ok(sc):
+                ok(f"  contacts.{fname} created (group={group_name})")
+            elif sc == 409:
+                # Race condition — created between our GET and POST. Regroup.
+                self._regroup_property_to_match("contacts", fname, group_name)
+            else:
+                warn(f"  contacts.{fname} create: {sc} {str(rc)[:200]}")
+                self.add_manual_step(
+                    f"contacts.{fname}",
+                    self.url("contacts", self.portal, "property-settings"),
+                    f"Pre-create contact property {fname!r} (type derived "
+                    f"from form field_type={declared!r}) under group "
+                    f"{group_name!r}, then re-run the build to create forms.",
+                    f"POST /crm/v3/properties/contacts returned {sc}: {str(rc)[:200]}",
+                )
 
     def create_forms(self) -> None:
         if not self.plan.get("forms"):
@@ -787,57 +1165,183 @@ class Builder:
             "company": "single_line_text",
             "jobtitle": "single_line_text",
         }
+        # Field types that are valid HubSpot Forms v3 fieldType values.
+        # The plan can declare any of these via field["field_type"].
+        # NOTE (verified 2026-04-27 via 400-error probe of v3 Forms endpoint):
+        # The authoritative list of known type ids returned by HubSpot is:
+        #   datepicker, dropdown, email, file, mobile_phone, multi_line_text,
+        #   multiple_checkboxes, number, payment_link_radio, phone, radio,
+        #   single_checkbox, single_line_text
+        # `dropdown` is the v3 API value (not `dropdown_select`); each option
+        # must include a `displayOrder` integer. The previous `dropdown_select`
+        # alias was rejected silently — verified on 1800LAW1010 production run.
+        SUPPORTED_FIELD_TYPES = {
+            "single_line_text", "multi_line_text", "email", "phone_number",
+            "phone", "mobile_phone", "number", "dropdown",
+            "datepicker", "radio", "multiple_checkboxes", "single_checkbox",
+            "file",
+        }
+
+        # Plan branding for theming (used when form has a `theme` block, AND
+        # — per fix J — as the always-applied default when the plan omits one).
+        plan_brand = self.plan.get("branding", {}) or {}
+        research_brand = self.research.get("branding", {}) or {}
+        plan_primary_color = (plan_brand.get("primary_color")
+                              or research_brand.get("primary_color")
+                              or plan_brand.get("accent_color")
+                              or research_brand.get("accent_color")
+                              or "#3B82F6")
+
+        # HubSpot Forms v3 requires every field to carry a `validation` object.
+        # Email fields use blocked-domain settings; number fields can carry
+        # min/max range; everything else gets the no-op default.
+        # NOTE (verified 2026-04-26): HubSpot's public docs are ambiguous on
+        # the exact key names for numeric range validation in the v3 Forms API.
+        # `minAllowedDigits` / `maxAllowedDigits` works for the validated
+        # Boomer NPS form (1-10 scale) — leaving as-is until we hit a 4xx that
+        # tells us otherwise. TODO: revisit if a POST 4xx mentions validation.
+        def _validation(field_name: str, ftype: str, fld: dict) -> dict:
+            if ftype == "email":
+                return {
+                    "blockedEmailDomains": [],
+                    "useDefaultBlockList": False,
+                }
+            if ftype == "number":
+                v: dict = {}
+                if "min" in fld:
+                    v["minAllowedDigits"] = fld["min"]
+                if "max" in fld:
+                    v["maxAllowedDigits"] = fld["max"]
+                return v
+            return {}
+
+        def _build_form_body(fp: dict) -> tuple[dict, list[dict]]:
+            """Return (body, all_fields) for a planned form. Pure builder —
+            no API calls. Callers reuse this for both POST (create) and PUT
+            (PATCH-on-existing) so the wire payload is identical."""
+            all_fields = []
+            for fld in fp["fields"]:
+                declared = fld.get("field_type", "single_line_text")
+                ftype = DEFAULT_CONTACT_FIELD_TYPES.get(fld["name"], declared)
+                if ftype not in SUPPORTED_FIELD_TYPES:
+                    warn(f"  unknown field_type {ftype!r} on {fld['name']}; coercing to single_line_text")
+                    ftype = "single_line_text"
+                field_obj = {
+                    "objectTypeId": "0-1",
+                    "name": fld["name"],
+                    "label": fld["label"],
+                    "required": fld.get("required", False),
+                    "hidden": False,
+                    "fieldType": ftype,
+                    "validation": _validation(fld["name"], ftype, fld),
+                }
+                # `dropdown` is the v3 API value (not `dropdown_select`); each
+                # option must include a `displayOrder` integer (verified
+                # 2026-04-27).
+                if ftype == "dropdown":
+                    opts = fld.get("options") or []
+                    norm_opts = []
+                    for idx, o in enumerate(opts):
+                        if isinstance(o, dict):
+                            norm_opts.append({
+                                "label": str(o.get("label", o.get("value", ""))),
+                                "value": str(o.get("value", o.get("label", ""))),
+                                "displayOrder": idx + 1,
+                            })
+                        else:
+                            norm_opts.append({
+                                "label": str(o), "value": str(o),
+                                "displayOrder": idx + 1,
+                            })
+                    field_obj["options"] = norm_opts
+                all_fields.append(field_obj)
+
+            groups = [{"groupType": "default_group", "richTextType": "text",
+                       "fields": all_fields[i:i+3]} for i in range(0, len(all_fields), 3)]
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+
+            # Always synthesize a default style block from branding (fix J).
+            # plan["forms"][i].theme overlays explicit values on top.
+            display_options: dict = {
+                "renderRawHtml": False,
+                "theme": "default_style",
+                "submitButtonText": fp.get("submit_text", "Submit"),
+                "style": {
+                    "submitColor": plan_primary_color,
+                    "submitFontColor": "#FFFFFF",
+                },
+            }
+            theme = fp.get("theme") or {}
+            if theme:
+                if theme.get("submit_button_color"):
+                    display_options["style"]["submitColor"] = theme["submit_button_color"]
+                if theme.get("submit_text_color"):
+                    display_options["style"]["submitFontColor"] = theme["submit_text_color"]
+
+            body = {"name": fp["name"], "formType": "hubspot",
+                    "createdAt": now, "updatedAt": now, "archived": False,
+                    "fieldGroups": groups,
+                    "configuration": {"language": "en", "cloneable": True, "editable": True,
+                                      "archivable": True, "recaptchaEnabled": False,
+                                      "createNewContactForNewEmail": False,
+                                      "allowLinkToResetKnownValues": False},
+                    "displayOptions": display_options,
+                    "legalConsentOptions": {"type": "none"}}
+            return body, all_fields
+
+        def _fingerprint(field_groups: list[dict]) -> tuple:
+            """Stable signature for form schema drift detection. Tuple of
+            (field_count, sorted (name, fieldType) pairs). If this tuple
+            differs between an existing form and the planned form, we PATCH."""
+            fields = []
+            for g in (field_groups or []):
+                for f in (g.get("fields") or []):
+                    fields.append((f.get("name", ""), f.get("fieldType", "")))
+            return (len(fields), tuple(sorted(fields)))
+
         for fp in self.plan["forms"]:
             # Find existing by listing all (HubSpot list endpoint doesn't filter by name)
             existing_guid = None
+            existing_fingerprint = None
             s, r = self.client.request("GET", "/marketing/v3/forms", query={"limit": 100})
             if self.client.is_ok(s):
                 for f in r.get("results", []):
                     if f.get("name") == fp["name"]:
                         existing_guid = f["id"]
+                        existing_fingerprint = _fingerprint(f.get("fieldGroups", []) or [])
                         break
+
+            body, all_fields = _build_form_body(fp)
+            planned_fingerprint = _fingerprint(body["fieldGroups"])
+
             if existing_guid:
-                self.manifest["forms"][fp["name"]] = existing_guid
-                ok(f"reusing form {fp['name']}")
+                if existing_fingerprint != planned_fingerprint:
+                    # Schema drift: PATCH the form so the new fields/theme land.
+                    # PUT is the v3 update verb. If HubSpot rejects (some
+                    # hubspot-type forms can't be fully replaced via the API),
+                    # we log a manual_step telling the rep to delete + recreate.
+                    s2, r2 = self.client.request(
+                        "PUT", f"/marketing/v3/forms/{existing_guid}", body)
+                    if self.client.is_ok(s2):
+                        self.manifest["forms"][fp["name"]] = existing_guid
+                        ok(f"form {fp['name']} schema updated → {existing_guid} (PATCH)")
+                    else:
+                        warn(f"form {fp['name']}: PATCH rejected ({s2}); leaving stale schema in place")
+                        self.add_error(f"form.patch:{fp['name']}", s2, r2)
+                        self.manifest["forms"][fp["name"]] = existing_guid
+                        self.add_manual_step(
+                            f"Refresh form schema: {fp['name']}",
+                            self.url("forms", self.portal),
+                            (f"The existing form {fp['name']!r} still has the old "
+                             f"field set. Delete it in the UI and re-run, or edit "
+                             f"by hand to add the planned fields."),
+                            # Forbidden token "Forms API" forces sanitize.
+                            f"Forms API rejected schema PATCH (status {s2})",
+                        )
+                else:
+                    self.manifest["forms"][fp["name"]] = existing_guid
+                    ok(f"reusing form {fp['name']} (schema matches)")
             else:
-                # Split fields into groups of max 3 (HubSpot constraint)
-                # HubSpot Forms v3 requires every field to carry a `validation` object.
-                # Email fields use blocked-domain settings; everything else gets the no-op
-                # default. The error message "required fields were not set: [validation]"
-                # is what failed previously when the key was omitted.
-                def _validation(field_name: str, ftype: str) -> dict:
-                    if ftype == "email":
-                        return {
-                            "blockedEmailDomains": [],
-                            "useDefaultBlockList": False,
-                        }
-                    return {}
-                all_fields = []
-                for fld in fp["fields"]:
-                    ftype = DEFAULT_CONTACT_FIELD_TYPES.get(
-                        fld["name"], fld.get("field_type", "single_line_text"))
-                    all_fields.append({
-                        "objectTypeId": "0-1",
-                        "name": fld["name"],
-                        "label": fld["label"],
-                        "required": fld.get("required", False),
-                        "hidden": False,
-                        "fieldType": ftype,
-                        "validation": _validation(fld["name"], ftype),
-                    })
-                groups = [{"groupType": "default_group", "richTextType": "text",
-                           "fields": all_fields[i:i+3]} for i in range(0, len(all_fields), 3)]
-                now = datetime.datetime.utcnow().isoformat() + "Z"
-                body = {"name": fp["name"], "formType": "hubspot",
-                        "createdAt": now, "updatedAt": now, "archived": False,
-                        "fieldGroups": groups,
-                        "configuration": {"language": "en", "cloneable": True, "editable": True,
-                                          "archivable": True, "recaptchaEnabled": False,
-                                          "createNewContactForNewEmail": False,
-                                          "allowLinkToResetKnownValues": False},
-                        "displayOptions": {"renderRawHtml": False, "theme": "default_style",
-                                           "submitButtonText": fp.get("submit_text", "Submit")},
-                        "legalConsentOptions": {"type": "none"}}
                 s, r = self.client.request("POST", "/marketing/v3/forms", body)
                 if self.client.is_ok(s):
                     self.manifest["forms"][fp["name"]] = r["id"]
@@ -845,25 +1349,135 @@ class Builder:
                 else:
                     warn(f"form {fp['name']}: {s} {str(r)[:200]}")
                     self.add_error(f"form.create:{fp['name']}", s, r)
+                    if "fieldType" in str(r) or "fieldtype" in str(r).lower():
+                        warn(f"  TODO: spot-check the form preview in HubSpot — "
+                             f"the v3 fieldType values may need adjustment.")
                     continue
 
             form_guid = self.manifest["forms"][fp["name"]]
-            # Submit test fills (parallel)
+            # Submit test fills (parallel) — value generation branches on
+            # field TYPE (not field name), so dropdowns get a valid option,
+            # numbers get a number, etc.
             n = fp.get("test_submissions", 5)
-            first_names = ["Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Sam", "Drew"]
-            last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Davis", "Miller"]
+            tsd = fp.get("test_submission_data", {}) or {}
+            first_names = tsd.get("first_names") or [
+                "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Sam", "Drew",
+            ]
+            last_names = tsd.get("last_names") or [
+                "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Davis", "Miller",
+            ]
+            values_by_field = tsd.get("values_by_field") or {}
+
+            # NPS detection: form name contains "NPS" or any field is named nps_score.
+            field_names_lower = {fld["name"].lower() for fld in fp["fields"]}
+            is_nps = ("nps" in fp["name"].lower()) or ("nps_score" in field_names_lower)
+            score_dist = tsd.get("score_distribution") or {"9-10": 0.5, "7-8": 0.3, "1-6": 0.2}
+            feedback_pool = tsd.get("feedback_pool") or [
+                "Great service.", "Quick turnaround.", "Helpful team.",
+                "Could be better.", "Met expectations.",
+            ]
+
+            def _nps_bucket() -> str:
+                # Pick a bucket per the configured weights; default safe distribution.
+                buckets = list(score_dist.keys())
+                weights = [float(score_dist.get(b, 0)) for b in buckets]
+                if sum(weights) <= 0:
+                    return random.choice(["9-10", "7-8", "1-6"])
+                return random.choices(buckets, weights=weights, k=1)[0]
+
+            def _nps_score_from_bucket(bucket: str) -> int:
+                if bucket == "9-10":
+                    return random.choice([9, 10])
+                if bucket == "7-8":
+                    return random.choice([7, 8])
+                if bucket == "1-6":
+                    return random.randint(1, 6)
+                # Custom bucket of form "lo-hi"
+                try:
+                    lo, hi = bucket.split("-")
+                    return random.randint(int(lo), int(hi))
+                except (ValueError, AttributeError):
+                    return random.randint(1, 10)
+
+            def _value_for(fld: dict, i: int) -> str:
+                """Generate a valid test-submission value for a field. Branches
+                on field TYPE first (so dropdowns/numbers/multi-line text always
+                produce valid input), then falls back to the legacy name-based
+                special cases for email/firstname/lastname."""
+                fname = fld["name"]
+                # Plan-supplied per-field values win over everything.
+                if fname in values_by_field and values_by_field[fname]:
+                    return random.choice(values_by_field[fname])
+
+                # Legacy name-based path (kept for email/name fields whose
+                # values need realistic shape regardless of declared type).
+                if fname == "email":
+                    return f"demo-lead-{i}-{random.randint(1000,9999)}@demo{self.slug}.com"
+                if fname == "firstname":
+                    return random.choice(first_names)
+                if fname == "lastname":
+                    return random.choice(last_names)
+
+                # NPS-specific name-based shortcuts (still type-correct).
+                if is_nps and fname == "nps_score":
+                    return str(_nps_score_from_bucket(_nps_bucket()))
+                if is_nps and fname in ("nps_feedback", "feedback", "comments"):
+                    return random.choice(feedback_pool)
+
+                # Type-based generation — the big fix-E branch.
+                declared = fld.get("field_type", "single_line_text")
+                ftype = DEFAULT_CONTACT_FIELD_TYPES.get(fname, declared)
+
+                # `dropdown` is the v3 API value (verified 2026-04-27).
+                if ftype == "dropdown":
+                    opts = fld.get("options") or []
+                    if opts:
+                        choice = random.choice(opts)
+                        if isinstance(choice, dict):
+                            return str(choice.get("value", choice.get("label", "")))
+                        return str(choice)
+                    # Empty options on a dropdown is a plan bug — submitting "sample"
+                    # would 4xx and silently drop from form_submissions_count. Surface
+                    # it and skip this field entirely (omit from the submission).
+                    warn(f"form '{fp['name']}': dropdown field '{fname}' has empty options; "
+                         f"skipping this field in test submissions to avoid 4xx")
+                    return None  # caller filters None values out
+
+                if ftype == "number":
+                    validation = fld.get("validation") or {}
+                    lo = int(fld.get("min",
+                              validation.get("min",
+                              validation.get("minAllowedDigits", 1))))
+                    hi = int(fld.get("max",
+                              validation.get("max",
+                              validation.get("maxAllowedDigits", 100))))
+                    if hi < lo:
+                        lo, hi = hi, lo
+                    # If this is the NPS form's score field hit via a non-
+                    # standard property name, weight by score_distribution.
+                    if is_nps and lo == 1 and hi == 10:
+                        return str(_nps_score_from_bucket(_nps_bucket()))
+                    return str(random.randint(lo, hi))
+
+                if ftype == "multi_line_text":
+                    return random.choice(feedback_pool)
+
+                if ftype in ("phone", "phone_number"):
+                    return (f"({random.randint(200, 999)}) "
+                            f"{random.randint(200, 999)}-{random.randint(1000, 9999)}")
+
+                # single_line_text and anything else: return a sensible default.
+                return "sample"
+
             submission_bodies = []
             for i in range(n):
                 fields = []
                 for fld in fp["fields"]:
-                    if fld["name"] == "email":
-                        val = f"demo-lead-{i}-{random.randint(1000,9999)}@demo{self.slug}.com"
-                    elif fld["name"] == "firstname":
-                        val = random.choice(first_names)
-                    elif fld["name"] == "lastname":
-                        val = random.choice(last_names)
-                    else:
-                        val = "sample"
+                    val = _value_for(fld, i)
+                    if val is None:
+                        # _value_for returned None to signal "skip this field"
+                        # (empty-options dropdown). Omit it from the submission.
+                        continue
                     fields.append({"objectTypeId": "0-1", "name": fld["name"], "value": val})
                 submission_bodies.append({
                     "fields": fields,
@@ -872,6 +1486,11 @@ class Builder:
             with ThreadPoolExecutor(max_workers=3) as ex:
                 futures = [ex.submit(self.client.form_submit, form_guid, b) for b in submission_bodies]
                 ok_count = sum(1 for f in as_completed(futures) if 200 <= f.result()[0] < 300)
+            # Per-form actual-vs-planned breakdown is recorded so the integrity
+            # check can show which form fell short (fix D message).
+            self.manifest.setdefault("form_submissions_per_form", {})[fp["name"]] = {
+                "actual": ok_count, "planned": n,
+            }
             self.manifest["form_submissions_count"] += ok_count
             ok(f"  submissions: {ok_count}/{n}")
 
@@ -935,6 +1554,18 @@ class Builder:
             self.manifest["lead_scoring"]["list_url"] = self.url(
                 "contacts", self.portal, "objects/0-1/views", str(list_id), "list"
             )
+        # Mirror every list this run produced into a top-level manifest["lists"]
+        # so time_estimates can read len(manifest["lists"]) without knowing where
+        # each list lives. Includes the hot-leads list + any other_lists the
+        # plan added later.
+        all_lists = []
+        if list_id:
+            all_lists.append(list_id)
+        for lid in (self.manifest.get("lead_scoring", {}).get("other_lists") or []):
+            if lid and lid not in all_lists:
+                all_lists.append(lid)
+        if all_lists:
+            self.manifest["lists"] = all_lists
 
     # ---- Phase 10: AI marketing email ----
 
@@ -1012,13 +1643,62 @@ class Builder:
             except Exception as e:
                 warn(f"hero image fetch failed: {e}")
 
-        primary = self.research.get("branding", {}).get("primary_color", "#1a1a1a")
-        secondary = self.research.get("branding", {}).get("secondary_color", "#FF6B35")
+        # Branding: prefer plan["branding"] (locked schema), then research["branding"] (legacy),
+        # then industry-neutral defaults. The old #FF6B35 fallback was Shipperz transport orange
+        # and bled into every demo regardless of prospect.
+        plan_brand = self.plan.get("branding", {}) or {}
+        research_brand = self.research.get("branding", {}) or {}
+        primary = (plan_brand.get("primary_color")
+                   or research_brand.get("primary_color")
+                   or "#1a1a1a")
+        secondary = (plan_brand.get("secondary_color")
+                     or research_brand.get("secondary_color")
+                     or "#1A1A1A")
+        accent = (plan_brand.get("accent_color")
+                  or research_brand.get("accent_color")
+                  or "#3B82F6")
         company_name = self.manifest["company"]["name"]
 
         hero_img_html = ""
         if hero_b64:
             hero_img_html = f'<img src="data:image/png;base64,{hero_b64}" alt="{company_name} hero" style="display:block;width:100%;height:auto;border-radius:8px;margin:0 0 24px 0">'
+
+        # CTA color: plan field wins, else branding primary. The legacy hardcoded
+        # #FF6B35 leaked Shipperz transport orange into every demo's button.
+        cta_color = me.get("cta_color") or primary
+        cta_text = me.get("cta_text", "Learn more")
+        cta_url = me.get("cta_url") or f"https://www.{self.plan['company']['domain']}"
+        footer_tagline = me.get("footer_tagline") or company_name
+
+        # Email body: prefer the LLM-authored body_html in the plan; else build a
+        # generic, industry-neutral fallback from optional `steps`. The legacy
+        # fallback hardcoded "vehicle and route" / "Day of pickup" / "auto transport".
+        if me.get("body_html"):
+            body_inner_html = me["body_html"]
+        else:
+            steps = me.get("steps") or [
+                {"timing": "Within 1 hour", "detail": "We confirm your details."},
+                {"timing": "Within 24 hours", "detail": "You receive a personalized proposal."},
+                {"timing": "Next step", "detail": "Hand-off to your dedicated rep."},
+            ]
+            steps_html = "".join(
+                f'<li><strong>{s.get("timing", "Next")}:</strong> {s.get("detail", "")}</li>'
+                for s in steps
+            )
+            company_blurb = (self.plan.get("company") or {}).get("description", "")
+            blurb_first = company_blurb.split(".")[0] + "." if company_blurb else ""
+            body_inner_html = (
+                f"<p>Thanks for getting in touch with {company_name}. Here's what happens next:</p>"
+                f'<ol style="padding-left:20px;">{steps_html}</ol>'
+                f'<p style="margin-top:24px;">'
+                f'<a href="{cta_url}" style="display:inline-block;background:{cta_color};color:#ffffff;'
+                f'text-decoration:none;padding:14px 28px;border-radius:6px;font-weight:600;">{cta_text}</a>'
+                f"</p>"
+                f'<p style="color:#666;font-size:13px;margin-top:32px;border-top:1px solid #eee;padding-top:16px;">'
+                f"Questions? Reply to this email and we'll get back shortly.<br>"
+                f"{company_name}{(' · ' + blurb_first) if blurb_first else ''}"
+                f"</p>"
+            )
 
         html_body = f"""
 <!DOCTYPE html>
@@ -1031,22 +1711,10 @@ class Builder:
   </div>
   <div style="padding:0 32px;">{hero_img_html}</div>
   <div style="padding:0 32px 32px 32px;color:#1a1a1a;font-size:16px;line-height:1.6;">
-    <p>Thanks for requesting a quote with {company_name}. Here's what happens next:</p>
-    <ol style="padding-left:20px;">
-      <li><strong>Within 1 hour:</strong> Our team confirms your pickup and delivery details.</li>
-      <li><strong>Within 24 hours:</strong> You receive a personalized quote tailored to your vehicle and route.</li>
-      <li><strong>Day of pickup:</strong> Door-to-door enclosed transport, with real-time updates.</li>
-    </ol>
-    <p style="margin-top:24px;">
-      <a href="https://www.{self.plan['company']['domain']}" style="display:inline-block;background:{secondary};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:6px;font-weight:600;">View our services</a>
-    </p>
-    <p style="color:#666;font-size:13px;margin-top:32px;border-top:1px solid #eee;padding-top:16px;">
-      Questions? Reply to this email and we'll get back within an hour.<br>
-      {company_name} · {self.plan['company'].get('description', '').split('.')[0]}.
-    </p>
+    {body_inner_html}
   </div>
   <div style="background:{primary};color:#ffffff;padding:16px 32px;text-align:center;font-size:12px;">
-    {company_name} — Premium auto transport
+    {footer_tagline}
   </div>
 </div>
 </body></html>
@@ -1090,22 +1758,41 @@ class Builder:
                     }
                     wbody["alignment"] = "center"
                 elif wbody.get("path") == "@hubspot/rich_text":
-                    wbody["html"] = (
-                        f'<h1 style="text-align:center;color:#1a1a1a;font-size:28px;line-height:1.2;">'
-                        f'{me["subject"]}</h1>'
-                        f'<p style="font-size:16px;line-height:1.6;color:#1a1a1a;">'
-                        f'Hi {{{{contact.firstname}}}}, thanks for requesting a quote with {company_name}. '
-                        f'Here\'s what happens next:</p>'
-                        f'<ol style="font-size:15px;line-height:1.65;color:#333;">'
-                        f'<li><strong>Within 1 hour:</strong> Our team confirms your details.</li>'
-                        f'<li><strong>Within 24 hours:</strong> You receive a personalized quote.</li>'
-                        f'<li><strong>Day of pickup:</strong> Door-to-door service with real-time updates.</li>'
-                        f'</ol>'
-                        f'<p style="text-align:center;margin-top:24px;">'
-                        f'<a href="https://www.{self.plan["company"]["domain"]}" '
-                        f'style="display:inline-block;background:#FF6B35;color:#fff;padding:14px 28px;'
-                        f'border-radius:6px;text-decoration:none;font-weight:600;">View our services</a></p>'
-                    )
+                    # Use plan body_html verbatim if provided; else build a generic
+                    # industry-neutral widget body from optional `steps`. The legacy
+                    # widget hardcoded "vehicle/route", "Day of pickup", and a
+                    # #FF6B35 transport-orange CTA — all leaked into non-transport demos.
+                    if me.get("body_html"):
+                        widget_html = (
+                            f'<h1 style="text-align:center;color:#1a1a1a;font-size:28px;line-height:1.2;">'
+                            f'{me["subject"]}</h1>'
+                            f'{me["body_html"]}'
+                        )
+                    else:
+                        steps = me.get("steps") or [
+                            {"timing": "Within 1 hour", "detail": "We confirm your details."},
+                            {"timing": "Within 24 hours", "detail": "You receive a personalized proposal."},
+                            {"timing": "Next step", "detail": "Hand-off to your dedicated rep."},
+                        ]
+                        steps_html = "".join(
+                            f'<li><strong>{s.get("timing", "Next")}:</strong> {s.get("detail", "")}</li>'
+                            for s in steps
+                        )
+                        widget_html = (
+                            f'<h1 style="text-align:center;color:#1a1a1a;font-size:28px;line-height:1.2;">'
+                            f'{me["subject"]}</h1>'
+                            f'<p style="font-size:16px;line-height:1.6;color:#1a1a1a;">'
+                            f'Hi {{{{contact.firstname}}}}, thanks for getting in touch with {company_name}. '
+                            f"Here's what happens next:</p>"
+                            f'<ol style="font-size:15px;line-height:1.65;color:#333;">'
+                            f'{steps_html}'
+                            f'</ol>'
+                            f'<p style="text-align:center;margin-top:24px;">'
+                            f'<a href="{cta_url}" '
+                            f'style="display:inline-block;background:{cta_color};color:#fff;padding:14px 28px;'
+                            f'border-radius:6px;text-decoration:none;font-weight:600;">{cta_text}</a></p>'
+                        )
+                    wbody["html"] = widget_html
             body = {
                 "name": me["name"], "subject": me["subject"],
                 "fromName": me.get("from_name", company_name),
@@ -1215,19 +1902,36 @@ class Builder:
             else:
                 warn(f"workflow {wf['name']}: {s} {str(r)[:300]}")
                 self.add_error(f"workflow.create:{wf['name']}", s, r)
+                # Fix F: send the rep to the workflow CREATE page, pre-tagged
+                # with the planned name. The doc generator prefers
+                # manifest["workflow_urls"][name] when set, so this fallback
+                # only fires when the API call also failed entirely.
+                create_url = (
+                    f"{self.url('workflows', self.portal)}/create?source=demo-prep"
+                    f"&template={urllib.parse.quote(wf['name'])}"
+                )
                 self.add_manual_step(
-                    f"Workflow: {wf['name']}", self.url("workflows", self.portal),
+                    f"Workflow: {wf['name']}", create_url,
                     f"Build via UI. Steps: " + " → ".join([s["type"] for s in wf.get("steps", [])]),
                     f"API returned {s}",
                 )
 
             for gap in gaps:
                 wid = self.manifest["workflows"].get(wf["name"], "")
+                if wid:
+                    gap_url = self.url("workflows", self.portal, "platform/flow", str(wid), "edit")
+                else:
+                    gap_url = (
+                        f"{self.url('workflows', self.portal)}/create?source=demo-prep"
+                        f"&template={urllib.parse.quote(wf['name'])}"
+                    )
                 self.add_manual_step(
                     f"Add {gap['type']} action to '{wf['name']}'",
-                    self.url("workflows", self.portal, "platform/flow", str(wid), "edit") if wid else self.url("workflows", self.portal),
+                    gap_url,
                     gap["description"] or f"Add {gap['type']} action at step {gap['step_index']}",
-                    f"v4 API does not support {gap['type']} action directly",
+                    # Public reason already polished. Internal_reason on the
+                    # manual_step still records the v4 limitation for debugging.
+                    f"v4 flows API: {gap['type']} action requires UI build",
                 )
 
     # ---- Phase 12: Sales Workspace Leads (object 0-136) ----
@@ -1300,9 +2004,15 @@ class Builder:
         else:
             ok(f"leads demo_customer property created (group={group_name or 'default'})")
 
-        labels = ["WARM", "HOT", "COLD"]
-        sources = ["Web form", "Inbound call", "LinkedIn outreach",
-                   "Referral", "Trade show", "Cold email"]
+        # Lead labels/sources/template come from plan["activity_content"] so we don't
+        # leak Shipperz "auto transport inquiry" into every demo. Industry-neutral
+        # defaults match the schema fallback table.
+        ac = self.plan.get("activity_content", {}) or {}
+        labels = ac.get("lead_labels") or ["WARM", "HOT", "COLD"]
+        sources = ac.get("lead_sources") or ["Web form", "Inbound call",
+                                             "LinkedIn outreach", "Referral",
+                                             "Trade show", "Cold email"]
+        lead_label_template = ac.get("lead_label_template") or "demo inquiry"
         contact_items = list(self.manifest["contacts"].items())  # [(email, id), ...]
 
         ok_count = 0
@@ -1313,7 +2023,7 @@ class Builder:
                 name_prefix = email.split("@")[0].replace(".", " ").title()
                 src = random.choice(sources)
                 props = {
-                    "hs_lead_name": f"{name_prefix} — auto transport inquiry ({src})",
+                    "hs_lead_name": f"{name_prefix} — {lead_label_template} ({src})",
                     "hs_lead_label": random.choice(labels),
                 }
                 if not skip_demo_customer:
@@ -1387,22 +2097,29 @@ class Builder:
                     "description": "Tags demo data created by hubspot-demo-prep skill."}
             self.client.request("POST", f"/crm/v3/properties/{obj}", body)
 
-        # Realistic transport-service line-item catalog
-        catalog = [
-            {"name": "Enclosed transport — coast to coast", "price": "2400"},
-            {"name": "Open transport — regional", "price": "850"},
-            {"name": "Expedited delivery (3-day)", "price": "650"},
-            {"name": "Insurance upgrade — full coverage", "price": "150"},
-            {"name": "White-glove pickup + delivery", "price": "300"},
-            {"name": "Storage (per day, post-delivery)", "price": "45"},
+        # Quote line-item catalog. The plan can supply industry-specific items via
+        # plan["quote_catalog"]; otherwise fall back to a neutral 5-item catalog
+        # (per plan-schema.md). The legacy hardcoded "Enclosed transport — coast to
+        # coast" leaked Shipperz vocabulary into every demo.
+        catalog = self.plan.get("quote_catalog") or [
+            {"name": "Initial consultation", "price": "250"},
+            {"name": "Standard service tier", "price": "850"},
+            {"name": "Premium service tier", "price": "2400"},
+            {"name": "Premium add-on", "price": "450"},
+            {"name": "Extended support", "price": "150"},
         ]
 
         deal_items = list(self.manifest["deals"].items())
         contact_ids = list(self.manifest["contacts"].values())
 
         for i, (deal_name, deal_id) in enumerate(deal_items):
-            # 1) Create 2-3 line items
-            n_items = random.randint(2, 3)
+            # 1) Create 2-3 line items. Clamp n_items to catalog size — the
+            # plan can supply a tiny industry-specific catalog (e.g. 1 SKU) and
+            # random.sample(catalog, n) raises ValueError when n > len(catalog).
+            if not catalog:
+                warn(f"quote catalog empty; skipping {deal_name}")
+                continue
+            n_items = min(random.randint(2, 3), len(catalog))
             picks = random.sample(catalog, n_items)
             li_ids = []
             for li in picks:
@@ -1564,14 +2281,63 @@ class Builder:
 
     # ---- Phase 15: Calculation property + property group ----
 
+    def _regroup_property_to_match(self, object_type: str, prop_name: str,
+                                   expected_group: str) -> bool:
+        """GET the existing property, compare groupName, PATCH if different.
+
+        Eliminates cross-prospect contamination: when a property exists from a
+        prior prospect's run, its groupName is whatever that prospect used
+        (e.g. `shipperz_demo_properties`). Without this PATCH, subsequent
+        prospects silently inherit the leaked group name. Caught by verify on
+        2026-04-27.
+
+        Returns True if the property is now correctly grouped (either it
+        already was, or the PATCH succeeded). False on any failure — caller
+        adds a manual step.
+        """
+        sg, rg = self.client.request(
+            "GET", f"/crm/v3/properties/{object_type}/{prop_name}")
+        if not self.client.is_ok(sg):
+            warn(f"  regroup {object_type}.{prop_name}: GET {sg} {str(rg)[:200]}")
+            self.add_manual_step(
+                f"{object_type}.{prop_name} groupName",
+                self.url("contacts", self.portal, "property-settings"),
+                f"Verify {prop_name} is in group {expected_group!r}",
+                f"GET returned {sg}",
+            )
+            return False
+        current_group = (rg.get("groupName") or "").strip()
+        if current_group == expected_group:
+            ok(f"  {object_type}.{prop_name} already in group {expected_group}")
+            return True
+        sp, rp = self.client.request(
+            "PATCH", f"/crm/v3/properties/{object_type}/{prop_name}",
+            {"groupName": expected_group})
+        if self.client.is_ok(sp):
+            log(f"  ✓ Phase 15: PATCHed {prop_name} groupName from "
+                f"{current_group!r} → {expected_group!r} (cross-prospect contamination)")
+            return True
+        warn(f"  regroup {object_type}.{prop_name}: PATCH {sp} {str(rp)[:200]}")
+        self.add_manual_step(
+            f"{object_type}.{prop_name} groupName",
+            self.url("contacts", self.portal, "property-settings"),
+            f"PATCH {prop_name} groupName from {current_group!r} to {expected_group!r}",
+            f"PATCH returned {sp}",
+        )
+        return False
+
     def create_calc_property_and_group(self) -> None:
         """Create the demo property group on deals, register `deal_age_days` as
         a plain number property (not a calculated one — HubSpot's
         calculation_equation grammar has no NOW() function and time-since via
         API is poorly documented), then backfill realistic per-deal values."""
         log("Phase 15: Property group + deal_age_days backfill")
-        group_name = "shipperz_demo_properties"
-        group_label = "Shipperz Demo"
+        # Industry-neutral defaults so the property admin doesn't show "Shipperz Demo"
+        # for every prospect. Plan["property_group"] overrides when present.
+        company_label = (self.manifest.get("company") or {}).get("name") or self.slug
+        pg = self.plan.get("property_group", {}) or {}
+        group_name = pg.get("name", f"{self.slug}_demo_properties")
+        group_label = pg.get("label", f"Demo ({company_label})")
 
         # 1) Create or reuse the group
         body = {"name": group_name, "label": group_label, "displayOrder": 1}
@@ -1594,14 +2360,34 @@ class Builder:
             "description": "Days since the deal was created (demo-populated; not a live calc).",
         }
         s, r = self.client.request("POST", "/crm/v3/properties/deals", prop_body)
-        if self.client.is_ok(s) or s == 409:
+        if self.client.is_ok(s):
             self.manifest["calc_property"] = {
                 "name": "deal_age_days", "group": group_name,
             }
             ok(f"deal_age_days property → {group_name}")
+        elif s == 409:
+            # 409 = property already exists from a prior prospect's run on the
+            # same sandbox. The previous version skipped silently — meaning the
+            # earlier prospect's groupName (e.g. `shipperz_demo_properties`)
+            # leaked into every subsequent prospect's manifest. Cross-prospect
+            # contamination, caught by verify on 2026-04-27.
+            #
+            # Fix: GET the existing property, compare groupName, and PATCH if
+            # different. This is the same regroup pattern used for
+            # `demo_customer` below — extended to deal_age_days.
+            self._regroup_property_to_match("deals", "deal_age_days", group_name)
+            self.manifest["calc_property"] = {
+                "name": "deal_age_days", "group": group_name,
+            }
         else:
             warn(f"deal_age_days property: {s} {str(r)[:200]}")
             self.add_error("calc_property.create", s, r)
+            self.add_manual_step(
+                "deal_age_days property",
+                self.url("contacts", self.portal, "property-settings/0-3"),
+                f"Create the deal_age_days property under group {group_name!r}",
+                f"POST /crm/v3/properties/deals returned {s}: {str(r)[:200]}",
+            )
 
         # 3) Backfill: each deal gets a plausible age (0-90 days).
         deal_ids = list(self.manifest.get("deals", {}).values())
@@ -1635,26 +2421,40 @@ class Builder:
         log("Phase 16: Marketing campaign")
         company_name = self.manifest["company"].get("name", "Demo")
 
+        # Marketing campaign: read fields from plan["marketing_campaign"] with
+        # quarterly-neutral fallbacks. The legacy hardcoded "Snowbird Season Q1 2026"
+        # / FL-AZ-TX snowbird audience leaked Shipperz vocabulary into every demo.
+        mc = self.plan.get("marketing_campaign") or {}
+        today = datetime.date.today()
+        quarter = f"Q{((today.month - 1) // 3) + 1} {today.year}"
+        default_utm = f"{self.slug}_{quarter.lower().replace(' ', '_')}"
+
+        campaign_name = mc.get("name", f"{company_name}: {quarter} Campaign")
+        start_date = mc.get("start_date", today.isoformat())
+        end_date = mc.get("end_date",
+                          (today + datetime.timedelta(days=90)).isoformat())
+        notes = mc.get("notes", "Quarterly nurture campaign.")
+        audience = mc.get("audience", "Active prospects.")
+        utm_campaign = mc.get("utm_campaign", default_utm)
+
         body = {"properties": {
-            "hs_name": f"{company_name}: Snowbird Season Q1 2026",
-            "hs_start_date": "2026-01-06",
-            "hs_end_date": "2026-04-15",
-            "hs_notes": ("Seasonal northbound campaign targeting FL/AZ/TX snowbirds "
-                         "returning to NY/MA/CT/NJ."),
-            "hs_audience": "Snowbirds 60+ owners of vehicles needing seasonal transport",
+            "hs_name": campaign_name,
+            "hs_start_date": start_date,
+            "hs_end_date": end_date,
+            "hs_notes": notes,
+            "hs_audience": audience,
             "hs_currency_code": "USD",
             "hs_campaign_status": "in_progress",
-            "hs_utm": "utm_source=hubspot&utm_medium=email&utm_campaign=snowbird_q1_2026",
+            "hs_utm": f"utm_source=hubspot&utm_medium=email&utm_campaign={utm_campaign}",
         }}
 
-        campaign_name = body["properties"]["hs_name"]
         s, r = self.client.request("POST", "/marketing/v3/campaigns", body)
         if s in (401, 403):
             warn(f"campaign blocked ({s}) — likely missing marketing.campaigns.write")
             self.add_manual_step(
                 "Marketing campaign",
                 self.url("marketing", self.portal, "campaigns"),
-                "Create campaign 'Snowbird Season Q1 2026' manually and associate the marketing email + NPS form.",
+                f"Create campaign {campaign_name!r} manually and associate the marketing email + form.",
                 "Token missing marketing.campaigns.write scope (enforced 2026-07-09)",
             )
             return
@@ -1727,30 +2527,102 @@ class Builder:
 
     # ---- Output ----
 
+    def _resolve_doc_replacement_id(self) -> str | None:
+        """Resolve the Google Doc id to overwrite (if any). SECURITY-CRITICAL:
+        every override path requires explicit per-prospect opt-in so a stale
+        env var or plan field from another run can never overwrite the wrong
+        prospect's doc.
+
+        Two opt-in paths:
+        1. Env: HUBSPOT_DEMOPREP_LOCKED_DOC_ID is honored ONLY when
+           HUBSPOT_DEMOPREP_LOCKED_DOC_SLUG matches self.slug.
+        2. Plan: plan["doc_replacement_id"] is honored ONLY when
+           plan["doc_replacement_acknowledged_slug"] matches self.slug.
+        Logs every overwrite decision so a regression is visible in the
+        transcript.
+        """
+        # Env path
+        env_id = self.env.get("HUBSPOT_DEMOPREP_LOCKED_DOC_ID")
+        env_slug = self.env.get("HUBSPOT_DEMOPREP_LOCKED_DOC_SLUG")
+        if env_id:
+            if env_slug == self.slug:
+                warn(f"WARN: Replacing existing Drive doc {env_id} per env opt-in (slug={self.slug})")
+                return env_id
+            else:
+                warn(
+                    f"HUBSPOT_DEMOPREP_LOCKED_DOC_ID set ({env_id}) but "
+                    f"HUBSPOT_DEMOPREP_LOCKED_DOC_SLUG={env_slug!r} does not match "
+                    f"current slug={self.slug!r}; ignoring."
+                )
+
+        # Plan path
+        plan_id = self.plan.get("doc_replacement_id")
+        plan_ack = self.plan.get("doc_replacement_acknowledged_slug")
+        if plan_id:
+            if plan_ack == self.slug:
+                warn(f"WARN: Replacing existing Drive doc {plan_id} per plan opt-in (slug={self.slug})")
+                return plan_id
+            else:
+                warn(
+                    f"plan['doc_replacement_id']={plan_id} present but "
+                    f"plan['doc_replacement_acknowledged_slug']={plan_ack!r} does not match "
+                    f"current slug={self.slug!r}; ignoring (no overwrite)."
+                )
+        return None
+
     def generate_doc(self) -> dict:
-        """Build the .docx demo runbook + (best-effort) upload to Drive."""
-        from doc_generator import generate_docx, upload_to_drive
-        log("Phase 17: Generate demo doc")
+        """Build the .docx demo runbook locally only. Drive upload is a
+        separate step (`upload_doc_to_drive`) so verifiers can inspect the
+        local file before the doc lands in front of the prospect."""
+        from doc_generator import generate_docx
+        log("Phase 17: Generate demo doc (local .docx)")
         docx_path = generate_docx(self.manifest, self.research, self.plan,
                                   slug=self.slug, work_dir=self.work_dir,
                                   portal=self.portal)
-        company_name = (self.plan.get("company") or {}).get("name") or self.slug
-        title = f"HubSpot Demo Prep · {company_name}"
-        locked_id = self.env.get("HUBSPOT_DEMOPREP_LOCKED_DOC_ID")
-        replace_doc_id = locked_id if (self.slug == "shipperzinc" and locked_id) else None
-        upload = upload_to_drive(docx_path, doc_title=title,
-                                 replace_doc_id=replace_doc_id)
         self.manifest["demo_doc"] = {
             "docx_path": docx_path,
+            # Drive fields populated later by upload_doc_to_drive().
+            "gdoc_url": None,
+            "doc_id": None,
+            "pdf_path": None,
+        }
+        ok(f"demo doc (local) → {docx_path}")
+        return self.manifest["demo_doc"]
+
+    def upload_doc_to_drive(self) -> dict:
+        """Upload the locally-generated .docx to Google Drive. Runs AFTER
+        verify_doc_urls so a broken-link doc never lands in front of the
+        prospect."""
+        from doc_generator import upload_to_drive
+        demo_doc = self.manifest.get("demo_doc") or {}
+        docx_path = demo_doc.get("docx_path")
+        if not docx_path or not os.path.exists(docx_path):
+            warn("upload_doc_to_drive: no local .docx to upload")
+            return demo_doc
+
+        company_name = (self.plan.get("company") or {}).get("name") or self.slug
+        title = f"HubSpot Demo Prep · {company_name}"
+        replace_doc_id = self._resolve_doc_replacement_id()
+
+        upload = upload_to_drive(docx_path, doc_title=title,
+                                 replace_doc_id=replace_doc_id)
+        demo_doc.update({
             "gdoc_url": upload.get("gdoc_url"),
             "doc_id": upload.get("doc_id"),
             "pdf_path": upload.get("pdf_path"),
-        }
-        if upload.get("gdoc_url"):
-            ok(f"demo doc → {upload['gdoc_url']}")
+        })
+        self.manifest["demo_doc"] = demo_doc
+        # Also persist into manifest["output"]["doc_url"] so downstream
+        # consumers (and the verify-agent expectation) can read a single
+        # canonical location. Previously this key was never set — the URL was
+        # printed to stdout but only stored under demo_doc.gdoc_url. Fix #5.
+        drive_url = upload.get("gdoc_url")
+        if drive_url:
+            self.manifest.setdefault("output", {})["doc_url"] = drive_url
+            ok(f"demo doc → {drive_url}")
         else:
             ok(f"demo doc → {docx_path} (Drive upload skipped)")
-        return self.manifest["demo_doc"]
+        return demo_doc
 
     # ---- Verification loop ----
     # After each create_* phase, GET back at least one representative artifact
@@ -1999,6 +2871,162 @@ class Builder:
             return False, f"GET campaign {cid} returned {s}"
         return True, f"campaign {cid} name={r.get('properties', {}).get('hs_name') or r.get('name')!r}"
 
+    def verify_doc_urls(self) -> tuple[bool, str]:
+        """Open the generated demo-doc.docx, parse every hyperlink, then:
+          1. For each link matching the HubSpot CRM contact-record pattern, GET the
+             contact id; flag any 404s (broken links in a prospect-facing doc).
+          2. Confirm every contact id in manifest["contacts"] appears as the target
+             of at least one link in the doc (so the doc isn't missing a persona).
+        Result is recorded in manifest["doc_url_verification"]. Returns
+        (verified, message) and gracefully skips when python-docx isn't importable.
+        """
+        result: dict = {
+            "checked": 0, "broken": [], "missing_contacts": [],
+            "doc_path": None, "skipped": False,
+        }
+        try:
+            from docx import Document  # type: ignore
+        except ImportError:
+            warn("verify_doc_urls: python-docx not installed; skipping")
+            result["skipped"] = True
+            self.manifest["doc_url_verification"] = result
+            return True, "skipped — python-docx not installed"
+
+        docx_path = (self.manifest.get("demo_doc") or {}).get("docx_path") \
+                    or f"{self.work_dir}/demo-doc.docx"
+        result["doc_path"] = docx_path
+        if not os.path.exists(docx_path):
+            self.manifest["doc_url_verification"] = result
+            return False, f"docx not found at {docx_path}"
+
+        try:
+            doc = Document(docx_path)
+        except Exception as e:  # noqa: BLE001
+            self.manifest["doc_url_verification"] = result
+            return False, f"failed to open docx: {e}"
+
+        # Collect every external URL from the docx relationships.
+        urls: list[str] = []
+        try:
+            for rel in doc.part.rels.values():
+                if rel.reltype.endswith("/hyperlink") and rel.target_ref:
+                    urls.append(rel.target_ref)
+        except Exception as e:  # noqa: BLE001
+            self.manifest["doc_url_verification"] = result
+            return False, f"failed to enumerate doc hyperlinks: {e}"
+
+        # Match the HubSpot contact-record URL pattern. Builder.url(...) builds
+        # https://app.hubspot.com/contacts/{portal}/record/0-1/{cid}.
+        contact_url_re = re.compile(
+            rf"https://app\.hubspot\.com/contacts/{re.escape(str(self.portal))}"
+            r"/record/0-1/(\d+)"
+        )
+        contact_ids_in_doc: set[str] = set()
+        for u in urls:
+            m = contact_url_re.search(u)
+            if not m:
+                continue
+            cid = m.group(1)
+            contact_ids_in_doc.add(cid)
+            result["checked"] += 1
+            s, _ = self.client.request("GET", f"/crm/v3/objects/contacts/{cid}")
+            if s == 404:
+                result["broken"].append(u)
+
+        # Confirm every manifest contact appears in at least one doc link.
+        manifest_cids = {str(cid) for cid in (self.manifest.get("contacts") or {}).values()}
+        result["missing_contacts"] = sorted(manifest_cids - contact_ids_in_doc)
+
+        self.manifest["doc_url_verification"] = result
+        verified = not result["broken"] and not result["missing_contacts"]
+        if verified:
+            return True, (f"checked {result['checked']} contact link(s); "
+                          f"all resolve and {len(manifest_cids)} contact(s) covered")
+        msg_parts = []
+        if result["broken"]:
+            msg_parts.append(f"{len(result['broken'])} broken link(s) (first: {result['broken'][0]})")
+        if result["missing_contacts"]:
+            msg_parts.append(f"{len(result['missing_contacts'])} contact id(s) missing from doc")
+        return False, "; ".join(msg_parts)
+
+    def verify_manifest_integrity(self) -> tuple[bool, str]:
+        """Sanity-check internal manifest consistency:
+          - form_submissions_count is within 20% of the planned total
+            (using math.ceil so a planned=1 still requires 1 actual)
+          - every plan contact has a manifest entry
+          - every plan deal has a manifest entry (case/whitespace normalized)
+        Records detailed result in manifest["manifest_integrity"]."""
+        result: dict = {
+            "form_submissions": {"actual": 0, "planned": 0, "ok": True,
+                                 "per_form": {}},
+            "missing_contacts": [], "missing_deals": [],
+        }
+
+        # Form submission count vs planned. Fix D: math.ceil — int(0.8*1) == 0
+        # made any-number-≥-0 pass, missing the small-count failures the gate
+        # was supposed to catch. Ceiling preserves "≥ 80%" intent for n=1,2,4.
+        planned_subs = sum(int(f.get("test_submissions", 0))
+                           for f in (self.plan.get("forms") or []))
+        actual_subs = int(self.manifest.get("form_submissions_count") or 0)
+        result["form_submissions"]["planned"] = planned_subs
+        result["form_submissions"]["actual"] = actual_subs
+        # Per-form breakdown so a debug log can pinpoint which form fell short.
+        result["form_submissions"]["per_form"] = dict(
+            self.manifest.get("form_submissions_per_form") or {}
+        )
+        if planned_subs > 0:
+            min_acceptable = math.ceil(planned_subs * 0.8)
+            result["form_submissions"]["ok"] = actual_subs >= min_acceptable
+
+        # Plan contacts vs manifest contacts (match on email, lowercased +
+        # stripped). Per-contact rewrites already happened in create_contacts,
+        # so the plan email matches the manifest key.
+        manifest_emails = {e.strip().lower()
+                          for e in (self.manifest.get("contacts") or {}).keys()}
+        for c in (self.plan.get("contacts") or []):
+            if c.get("email") and c["email"].strip().lower() not in manifest_emails:
+                result["missing_contacts"].append(c["email"])
+
+        # Plan deals vs manifest deals (case/whitespace-normalized match).
+        # Trailing whitespace or "Acme Co" vs "acme co" caused false-positive
+        # misses. Include both planned + actual lists in the error text.
+        def _norm(s: str) -> str:
+            return (s or "").strip().lower()
+        manifest_deal_names_norm = {_norm(n)
+                                    for n in (self.manifest.get("deals") or {}).keys()}
+        for d in (self.plan.get("deals") or []):
+            if d.get("name") and _norm(d["name"]) not in manifest_deal_names_norm:
+                result["missing_deals"].append(d["name"])
+
+        self.manifest["manifest_integrity"] = result
+
+        problems = []
+        if not result["form_submissions"]["ok"]:
+            per_form_str = ", ".join(
+                f"{name}: {pf.get('actual', 0)}/{pf.get('planned', 0)}"
+                for name, pf in (result["form_submissions"]["per_form"] or {}).items()
+            ) or "no per-form breakdown"
+            problems.append(
+                f"form submissions {actual_subs}/{planned_subs} (below 80% "
+                f"threshold; per-form: {per_form_str})"
+            )
+        if result["missing_contacts"]:
+            problems.append(
+                f"{len(result['missing_contacts'])} plan contact(s) missing from manifest"
+            )
+        if result["missing_deals"]:
+            planned_deal_names = [d.get("name") for d in (self.plan.get("deals") or []) if d.get("name")]
+            actual_deal_names = list((self.manifest.get("deals") or {}).keys())
+            problems.append(
+                f"{len(result['missing_deals'])} plan deal(s) missing from manifest "
+                f"(planned={planned_deal_names}; actual={actual_deal_names})"
+            )
+        if not problems:
+            return True, (f"submissions {actual_subs}/{planned_subs}, "
+                          f"{len(manifest_emails)} contact(s), "
+                          f"{len(manifest_deal_names_norm)} deal(s) all reconciled")
+        return False, "; ".join(problems)
+
     # ---- Run ----
 
     def run(self) -> dict:
@@ -2021,6 +3049,15 @@ class Builder:
                               is_empty_fn=lambda: not (self.manifest.get("custom_object") or {}).get("object_type_id"))
         self._run_with_verify("custom_events", self.create_custom_events, self.verify_custom_events,
                               is_empty_fn=lambda: not self.manifest.get("custom_events"))
+        # Pre-flight: ensure any custom contact properties referenced by plan
+        # forms exist on the contacts object BEFORE create_forms tries to use
+        # them (otherwise the form POST 400s with a generic "internal error").
+        # See _ensure_form_field_properties — fix #3, 2026-04-27.
+        try:
+            self._ensure_form_field_properties()
+        except Exception as exc:  # noqa: BLE001 — never crash the build
+            warn(f"_ensure_form_field_properties raised {type(exc).__name__}: {exc}")
+            self.add_error("ensure_form_field_properties", 0, str(exc))
         self._run_with_verify("forms", self.create_forms, self.verify_forms,
                               is_empty_fn=lambda: not self.manifest.get("forms"))
         self._run_with_verify("lead_scoring", self.lead_scoring, self.verify_lead_scoring,
@@ -2040,7 +3077,68 @@ class Builder:
                               self.verify_marketing_campaign,
                               is_empty_fn=lambda: not self.manifest.get("campaign_id"))
         self.save_manifest()
-        doc = self.generate_doc()
+        # Time-saved estimate (item 14): compute BEFORE generate_doc() so the
+        # doc renderer can show the hero stat + breakdown table. Wrapped so a
+        # failure in the optional module never blocks doc generation.
+        try:
+            from time_estimates import compute_time_saved  # local import: optional module
+            self.manifest["time_saved"] = compute_time_saved(self.manifest, self.plan)
+            log(f"  ⏱ Time saved: {self.manifest['time_saved']['total_pretty']} vs manual build")
+        except Exception as exc:  # noqa: BLE001 — never crash the build over a stat
+            warn(f"time_saved estimate skipped: {type(exc).__name__}: {exc}")
+            self.manifest.pop("time_saved", None)
+
+        # Fix A: verifier ordering. Runs BEFORE Drive upload so a broken-link
+        # or schema-drift doc never lands in front of the prospect.
+        #
+        # Order:
+        #   1. verify_manifest_integrity (diagnostic; logs loudly but proceeds)
+        #   2. generate_doc -> writes LOCAL .docx only
+        #   3. verify_doc_urls -> parses local .docx; records issues
+        #   4. upload_doc_to_drive -> Drive upload last
+        try:
+            verified, msg = self.verify_manifest_integrity()
+            self._record_verify("manifest_integrity", verified, False, msg)
+            if not verified:
+                # Diagnostic: log loudly but proceed. Errors are surfaced via the
+                # manifest so the rep can see them in the doc.
+                warn(f"manifest_integrity issues: {msg}")
+                self.manifest["errors"].append({
+                    "where": "verify.manifest_integrity",
+                    "status": 0, "body": msg,
+                })
+        except Exception as exc:  # noqa: BLE001
+            self._record_verify("manifest_integrity", False, False,
+                                f"manifest_integrity verifier raised {type(exc).__name__}: {exc}")
+
+        doc = self.generate_doc()  # local .docx only — no Drive upload yet
+        self.save_manifest()
+
+        try:
+            verified, msg = self.verify_doc_urls()
+            self._record_verify("doc_urls", verified, False, msg)
+            if not verified:
+                # Loud failure: a broken link in a prospect-facing doc is a
+                # support escalation. Add to manifest.errors so the rep sees it
+                # in the post-run summary, and proceeds with the Drive upload
+                # so the rep can manually patch — but tagged.
+                warn(f"doc_urls issues: {msg}")
+                self.manifest["errors"].append({
+                    "where": "verify.doc_urls",
+                    "status": 0, "body": msg,
+                })
+        except Exception as exc:  # noqa: BLE001
+            self._record_verify("doc_urls", False, False,
+                                f"doc_urls verifier raised {type(exc).__name__}: {exc}")
+        self.save_manifest()
+
+        # Drive upload last. Verifiers above already ran against the local docx.
+        try:
+            self.upload_doc_to_drive()
+            doc = self.manifest.get("demo_doc") or doc
+        except Exception as exc:  # noqa: BLE001
+            warn(f"upload_doc_to_drive failed: {type(exc).__name__}: {exc}")
+            self.add_error("upload_doc_to_drive", 0, str(exc))
         self.save_manifest()
         # Summary
         log("=" * 60)
@@ -2121,13 +3219,24 @@ class Builder:
             "HUBSPOT_DEMOPREP_SENDER_EMAIL", "demo@example.com"
         )
 
+        # Brand: support legacy plan["brand"] alongside the new plan["branding"]
+        # block; fall back to research["branding"] then industry-neutral defaults.
+        # The old "#FF6B35" accent default leaked Shipperz transport orange.
         brand = (self.plan.get("brand") or {})
+        plan_brand = self.plan.get("branding", {}) or {}
+        research_brand = self.research.get("branding", {}) or {}
         logo_path = brand.get(
             "logo_path",
             f"{self.work_dir}/{self.slug}-og.png",
         )
-        primary_color = brand.get("primary_color", "#1A1A1A")
-        accent_color = brand.get("accent_color", "#FF6B35")
+        primary_color = (brand.get("primary_color")
+                         or plan_brand.get("primary_color")
+                         or research_brand.get("primary_color")
+                         or "#1A1A1A")
+        accent_color = (brand.get("accent_color")
+                        or plan_brand.get("accent_color")
+                        or research_brand.get("accent_color")
+                        or "#3B82F6")
         primary_keyword = brand.get("primary_keyword")
 
         results = playwright_phases.run_all_phases(
@@ -2143,6 +3252,7 @@ class Builder:
             nps_form_guid=nps_form_guid,
             primary_keyword=primary_keyword,
             first_run=first_run,
+            work_dir=self.work_dir,
         )
 
         self.manifest["playwright_phases"] = results
@@ -2316,7 +3426,11 @@ if __name__ == "__main__":
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
         first_run = "--first-run" in sys.argv
         run_playwright = "--playwright" in sys.argv or "--ui" in sys.argv
-        slug = args[0] if args else "shipperzinc"
+        if not args:
+            print("usage: builder.py <slug> [--playwright] [--first-run]")
+            print("       builder.py cleanup <slug>")
+            sys.exit(2)
+        slug = args[0]
         b = Builder(slug)
         b.run()
         if run_playwright:

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Generate the per-prospect demo runbook .docx, then (optionally) upload to Google Drive.
 
-Ported from /tmp/demo-prep-shipperzinc/{make-doc.py, update-doc.py, export-pdf.py}.
-
 The visual layout (banner, status pills, agenda block, easter egg, "also built",
-recommendation, page-2 supporting documentation) is identical to the locked
-Shipperz runbook. All slug-specific copy and IDs come from build-plan.json,
-manifest.json, and research.json so the same generator works for any prospect.
+recommendation, page-2 supporting documentation) is fixed; all slug-specific
+copy, branding, and IDs come from build-plan.json, manifest.json, and
+research.json so the same generator works for any prospect.
 
 Public API:
     generate_docx(manifest, research, plan, *, slug, work_dir, portal) -> str
@@ -20,6 +18,7 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -32,15 +31,236 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 
-# ---- Brand palette (kept identical to make-doc.py) ----
-SHIPPERZ_ORANGE = RGBColor(0xFF, 0x6B, 0x35)  # default accent / kept name for parity
-SHIPPERZ_DARK = RGBColor(0x1A, 0x1A, 0x1A)
+# ---- Brand palette ----
+# BRAND_ACCENT_NEUTRAL is the default accent color used when the prospect's
+# branding doesn't specify one (see _accent_color) — slate blue (#3B82F6),
+# matching the plan-schema fallback. DARK_TEXT is the default near-black
+# neutral (#111827) used for headings and titles when no neutral_dark is set.
+BRAND_ACCENT_NEUTRAL = RGBColor(0x3B, 0x82, 0xF6)
+DARK_TEXT = RGBColor(0x11, 0x18, 0x27)
 GRAY = RGBColor(0x55, 0x55, 0x55)
 LIGHT_GRAY = RGBColor(0x99, 0x99, 0x99)
 SUCCESS_GREEN = RGBColor(0x2C, 0x84, 0x4F)
 WARN_AMBER = RGBColor(0xB1, 0x6E, 0x05)
 NOT_BUILT_RED = RGBColor(0xB9, 0x1C, 0x1C)
 BLUE = RGBColor(0x06, 0x6E, 0xA0)
+
+
+# =====================================================================
+# Branding helpers — pull accent / dark-text colors from the prospect's
+# branding block (manifest or plan) with safe fallbacks.
+# =====================================================================
+
+def _parse_hex_color(value) -> RGBColor | None:
+    """Parse a '#RRGGBB' or 'RRGGBB' hex string into an RGBColor. Returns None on failure."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lstrip("#")
+    if len(s) != 6:
+        return None
+    try:
+        return RGBColor(int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _branding_color(manifest: dict, plan: dict, key: str, default: RGBColor) -> RGBColor:
+    """Look up branding[key] in manifest first, then plan; parse hex; else default."""
+    for src in (manifest, plan):
+        if not isinstance(src, dict):
+            continue
+        branding = src.get("branding") or {}
+        if isinstance(branding, dict):
+            parsed = _parse_hex_color(branding.get(key))
+            if parsed is not None:
+                return parsed
+    return default
+
+
+def _accent_color(manifest: dict, plan: dict) -> RGBColor:
+    """Return the prospect's accent color from branding.accent_color, else BRAND_ACCENT_NEUTRAL."""
+    return _branding_color(manifest, plan, "accent_color", BRAND_ACCENT_NEUTRAL)
+
+
+def _dark_text(manifest: dict, plan: dict) -> RGBColor:
+    """Return the prospect's body/title text color from branding.neutral_dark, else DARK_TEXT."""
+    return _branding_color(manifest, plan, "neutral_dark", DARK_TEXT)
+
+
+# =====================================================================
+# Phantom-number guard — strip sentences containing dollar amounts that
+# don't appear in any real deal in the manifest or plan. Prevents the
+# recommendation copy from inventing figures the rep can't back up.
+# =====================================================================
+
+# Capture full money strings:
+#   group(1): the numeric body, e.g. "1,200,000" or "4.2" or "4,200.50"
+#   group(2): optional K/M suffix
+# Anchored on '$' and requires word-boundary-ish termination via the
+# (?![\d,\.]) lookahead so we never grab a partial number.
+_DOLLAR_PATTERN = re.compile(
+    r"\$(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)([KkMm])?(?![\d,\.])"
+)
+
+# Common abbreviations that should NOT terminate a sentence when followed by
+# whitespace + capital letter. Lookbehind below covers each.
+_ABBREV_LOOKBEHIND = re.compile(
+    r"(?<!\bInc)(?<!\bCo)(?<!\be\.g)(?<!\bi\.e)(?<!\betc)(?<!\bLtd)"
+    r"(?<!\bMr)(?<!\bMrs)(?<!\bMs)(?<!\bDr)(?<!\bSt)(?<!\bvs)\.\s+"
+)
+
+
+def _collect_deal_amounts(manifest: dict, plan: dict) -> set[float]:
+    """Gather all known deal amounts from manifest['deals'] (defensive shapes) and plan['deals']."""
+    amounts: set[float] = set()
+    manifest_deals = manifest.get("deals") if isinstance(manifest, dict) else None
+    if isinstance(manifest_deals, dict):
+        for v in manifest_deals.values():
+            if isinstance(v, dict):
+                a = v.get("amount")
+                if a is not None:
+                    try:
+                        amounts.add(float(a))
+                    except (TypeError, ValueError):
+                        pass
+    elif isinstance(manifest_deals, list):
+        for v in manifest_deals:
+            if isinstance(v, dict):
+                a = v.get("amount")
+                if a is not None:
+                    try:
+                        amounts.add(float(a))
+                    except (TypeError, ValueError):
+                        pass
+    plan_deals = plan.get("deals") if isinstance(plan, dict) else None
+    if isinstance(plan_deals, list):
+        for d in plan_deals:
+            if isinstance(d, dict):
+                a = d.get("amount")
+                if a is not None:
+                    try:
+                        amounts.add(float(a))
+                    except (TypeError, ValueError):
+                        pass
+    return amounts
+
+
+def _parse_dollar_match(num_str: str, suffix: str | None) -> float | None:
+    """Convert a regex-captured money string to a float USD value.
+
+    '1,200,000' -> 1_200_000.0
+    '4,200.50'  -> 4200.50
+    '4.2' + 'K' -> 4200.0
+    '2.5' + 'M' -> 2_500_000.0
+    Returns None if the string cannot be parsed.
+    """
+    cleaned = num_str.replace(",", "")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    if suffix:
+        s = suffix.lower()
+        if s == "k":
+            value *= 1_000
+        elif s == "m":
+            value *= 1_000_000
+    return value
+
+
+def _strip_phantom_numbers(text: str, manifest: dict, plan: dict) -> str:
+    """Remove any sentence containing a $-amount not present in the deal pool.
+
+    - Captures full grouped numbers ('$1,200,000', '$4,200.50') and K/M
+      shorthand ('$4.2K', '$2.5M') in one regex.
+    - Tolerance is split by capture style:
+        * K/M shorthand: 5% relative tolerance (absorbs '$4.2K' ≈ $4,200
+          when the real deal is $4,180 – $4,420).
+        * Explicit numeric (no K/M suffix): essentially-exact match
+          (within $0.01) so '$4,200.50' does NOT match a real '$4,200'
+          deal but '$4,200' does. Cents-precise figures the rep can't
+          back up get dropped.
+    - Sentence splitting respects common abbreviations (Inc., e.g., etc.,
+      Co., Ltd., Mr., Mrs., Ms., Dr., St., vs., i.e.) so a mid-sentence
+      'e.g.' won't fragment the sentence.
+    Sentences without dollar amounts are always kept.
+    """
+    if not text:
+        return text
+    amounts = _collect_deal_amounts(manifest, plan)
+
+    def _matches_known(value: float, *, shorthand: bool) -> bool:
+        for a in amounts:
+            if shorthand:
+                # K/M rounding tolerance — '$4.2K' should match $4,200
+                # exactly and any nearby figure within 5%.
+                tol = max(1.0, a * 0.05)
+            else:
+                # Explicit number: essentially-exact match (sub-cent).
+                # '$4,200.50' must NOT match a real '$4,200' deal.
+                tol = 0.01
+            if abs(value - a) <= tol:
+                return True
+        return False
+
+    sentences = _ABBREV_LOOKBEHIND.split(text)
+    kept: list[str] = []
+    for sent in sentences:
+        drop = False
+        for m in _DOLLAR_PATTERN.finditer(sent):
+            value = _parse_dollar_match(m.group(1), m.group(2))
+            if value is None:
+                continue
+            if not _matches_known(value, shorthand=bool(m.group(2))):
+                drop = True
+                break
+        if not drop:
+            kept.append(sent)
+    return " ".join(kept)
+
+
+# =====================================================================
+# Workflow URL preference — when programmatic creation succeeded, manifest
+# stores a specific edit URL per workflow name. Otherwise fall back to the
+# manual_steps[i].ui_url for that workflow, then to the workflows index.
+# =====================================================================
+
+def _workflow_url(workflow_name: str | None, manifest: dict, urls: dict) -> str:
+    """Best workflow link given what was actually built / queued for manual.
+
+    Lookup order:
+      1. exact-match against manifest["workflow_urls"][workflow_name]
+      2. substring-match against the keys of manifest["workflow_urls"]
+         (handles the common pattern where agenda items pass keyword stubs
+         like "nurture" / "routing" while builder stored full names like
+         "Boomer McLOUD - Welcome nurture")
+      3. matching manual_steps[i].ui_url (workflow built manually)
+      4. workflows index URL (last-resort fallback)
+    """
+    workflow_urls = (manifest.get("workflow_urls") or {}) if isinstance(manifest, dict) else {}
+    if workflow_name and isinstance(workflow_urls, dict):
+        # 1. Exact match
+        if workflow_urls.get(workflow_name):
+            return workflow_urls[workflow_name]
+        # 2. Substring match — agenda passes "nurture", manifest stored "Boomer - Welcome nurture"
+        wf_lower = workflow_name.lower()
+        for stored_name, stored_url in workflow_urls.items():
+            if not stored_url:
+                continue
+            stored_lower = stored_name.lower()
+            if wf_lower in stored_lower or stored_lower in wf_lower:
+                return stored_url
+    # 3. Fallback: matching manual_steps entry (workflow built manually in UI)
+    for ms in (manifest.get("manual_steps") or []):
+        item = (ms.get("item") or "").lower()
+        if "workflow" not in item:
+            continue
+        if not workflow_name or workflow_name.lower() in item:
+            ui = ms.get("ui_url")
+            if ui:
+                return ui
+    # 4. Last resort: workflows index
+    return urls.get("workflows") or ""
 
 
 # ---- Drive / OAuth defaults ----
@@ -122,7 +342,7 @@ def _shade_paragraph(p, fill_hex, left_border_hex=None):
         pPr.append(pBdr)
 
 
-def _bottom_border(p, color_hex="FF6B35"):
+def _bottom_border(p, color_hex="3B82F6"):
     pPr = p._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bottom = OxmlElement("w:bottom")
@@ -134,12 +354,13 @@ def _bottom_border(p, color_hex="FF6B35"):
     pPr.append(pBdr)
 
 
-def _h2(doc, text, *, color=SHIPPERZ_ORANGE, before=8):
+def _h2(doc, text, *, color=None, before=8):
+    """H2 heading. If color is None, callers should pass the prospect-derived accent."""
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(before)
     p.paragraph_format.space_after = Pt(2)
     r = p.add_run(text.upper())
-    _set_run(r, color=color, bold=True, size=10)
+    _set_run(r, color=color if color is not None else BRAND_ACCENT_NEUTRAL, bold=True, size=10)
 
 
 def _status_pill(p, text, color):
@@ -199,12 +420,11 @@ def _banner_path(work_dir: str, slug: str) -> str | None:
     """Return the first banner image that exists, or None."""
     candidates = [
         os.path.join(work_dir, f"{slug}-banner.png"),
-        os.path.join(work_dir, "shipperz-banner.png") if slug == "shipperzinc" else None,
         os.path.join(work_dir, "hero-image-email.png"),
         os.path.join(work_dir, "hero-image.png"),
     ]
     for c in candidates:
-        if c and os.path.isfile(c):
+        if os.path.isfile(c):
             return c
     return None
 
@@ -220,6 +440,92 @@ def _format_currency(amount) -> str:
         return str(amount or "")
 
 
+def _format_runtime(seconds) -> str | None:
+    """Render manifest['runtime_seconds'] as e.g. '4m 12s'. None on bad input."""
+    try:
+        s = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return None
+    if s <= 0:
+        return None
+    if s < 60:
+        return f"{s}s"
+    m, r = divmod(s, 60)
+    return f"{m}m {r}s" if r else f"{m}m"
+
+
+def _render_time_saved_hero(doc, manifest: dict, plan: dict) -> None:
+    """Hero stat under the title bar: '⏱ Saved ~Xh vs manual HubSpot setup'.
+
+    Renders nothing if manifest['time_saved'] is missing or malformed —
+    graceful degradation per item 14's "don't break" clause.
+    """
+    ts = (manifest or {}).get("time_saved") or {}
+    pretty = ts.get("total_pretty")
+    if not pretty:
+        return
+    accent = _accent_color(manifest, plan or {})
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after = Pt(0)
+    r = p.add_run(f"⏱  Saved {pretty} vs manual HubSpot setup")
+    _set_run(r, color=accent, bold=True, size=13)
+    runtime_pretty = _format_runtime(manifest.get("runtime_seconds"))
+    if runtime_pretty:
+        sub = doc.add_paragraph()
+        sub.paragraph_format.space_before = Pt(0)
+        sub.paragraph_format.space_after = Pt(4)
+        sr = sub.add_run(f"Built in {runtime_pretty}")
+        _set_run(sr, color=GRAY, italic=True, size=9)
+
+
+def _render_time_saved_breakdown(doc, manifest: dict, plan: dict) -> None:
+    """Per-phase breakdown table at the bottom of the doc.
+
+    Columns: Phase | Built | Manual time. One row per non-zero entry +
+    a final total row. 9pt font, lined. Skips silently if missing.
+    """
+    ts = (manifest or {}).get("time_saved") or {}
+    breakdown = ts.get("breakdown") or []
+    if not breakdown:
+        return
+    accent = _accent_color(manifest, plan or {})
+    _h2(doc, "Time saved vs manual build", color=accent, before=10)
+
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    hdr = table.rows[0].cells
+    for cell, label in zip(hdr, ("Phase", "Built", "Manual time")):
+        cell_para = cell.paragraphs[0]
+        cell_para.paragraph_format.space_after = Pt(0)
+        run = cell_para.add_run(label)
+        _set_run(run, color=accent, bold=True, size=9)
+
+    for row in breakdown:
+        cells = table.add_row().cells
+        for idx, value in enumerate((
+            str(row.get("label") or ""),
+            str(row.get("count") or 0),
+            str(row.get("subtotal_pretty") or ""),
+        )):
+            cell_para = cells[idx].paragraphs[0]
+            cell_para.paragraph_format.space_after = Pt(0)
+            run = cell_para.add_run(value)
+            _set_run(run, size=9)
+
+    # Total row.
+    total_cells = table.add_row().cells
+    for idx, value in enumerate((
+        "TOTAL",
+        str(sum(int(r.get("count") or 0) for r in breakdown)),
+        str(ts.get("total_pretty") or ""),
+    )):
+        cell_para = total_cells[idx].paragraphs[0]
+        cell_para.paragraph_format.space_after = Pt(0)
+        run = cell_para.add_run(value)
+        _set_run(run, color=accent, bold=True, size=9)
+
+
 def _build_doc(manifest: dict, research: dict, plan: dict, *,
                slug: str, work_dir: str, portal: str) -> Document:
     company = plan.get("company") or {}
@@ -227,6 +533,8 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     urls = _hub_urls(portal, manifest)
     agenda = plan.get("agenda") or []
     easter = plan.get("easter_egg") or {}
+    accent = _accent_color(manifest, plan)
+    dark = _dark_text(manifest, plan)
 
     doc = Document()
     for section in doc.sections:
@@ -261,8 +569,15 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     p.paragraph_format.space_after = Pt(0)
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     r = p.add_run("HubSpot Demo Prep")
-    _set_run(r, color=SHIPPERZ_DARK, bold=True, size=18)
-    _bottom_border(p)
+    _set_run(r, color=dark, bold=True, size=18)
+    _bottom_border(p, color_hex="%02X%02X%02X" % (accent[0], accent[1], accent[2]))
+
+    # Time-saved hero stat (item 14). Renders nothing if manifest['time_saved']
+    # is missing, so older runs and module failures degrade gracefully.
+    try:
+        _render_time_saved_hero(doc, manifest, plan)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Subtitle line
     today = datetime.date.today().strftime("%B %-d, %Y")
@@ -292,20 +607,20 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     _set_run(r, size=9.5)
 
     # ---- AGENDA ----
-    _h2(doc, "Agenda (from sales rep)", before=8)
+    _h2(doc, "Agenda (from sales rep)", color=accent, before=8)
     for i, item in enumerate(agenda, 1):
-        _render_agenda_item(doc, i, item, manifest=manifest, urls=urls, portal=portal)
+        _render_agenda_item(doc, i, item, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
     # ---- EASTER EGG ----
     if easter:
-        _render_easter_egg(doc, easter, manifest=manifest, urls=urls, portal=portal)
+        _render_easter_egg(doc, easter, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
     # ---- ALSO BUILT ----
-    _h2(doc, "Also built (pull these into the demo if useful)", before=8)
+    _h2(doc, "Also built (pull these into the demo if useful)", color=accent, before=8)
     _render_also_built(doc, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
     # ---- RECOMMENDATION ----
-    _h2(doc, "Recommendation", before=6)
+    _h2(doc, "Recommendation", color=accent, before=6)
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(0)
     r = p.add_run(_recommendation_text(manifest, plan))
@@ -317,8 +632,8 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     p.paragraph_format.space_before = Pt(14)
     p.paragraph_format.space_after = Pt(2)
     r = p.add_run("Supporting documentation")
-    _set_run(r, color=SHIPPERZ_DARK, bold=True, size=16)
-    _bottom_border(p)
+    _set_run(r, color=dark, bold=True, size=16)
+    _bottom_border(p, color_hex="%02X%02X%02X" % (accent[0], accent[1], accent[2]))
 
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(6)
@@ -326,19 +641,19 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     _set_run(r, color=GRAY, size=9)
 
     # Pre-demo checklist
-    _h2(doc, "Pre-demo checklist", before=2)
+    _h2(doc, "Pre-demo checklist", color=accent, before=2)
     _render_checklist(doc, manifest=manifest, urls=urls, portal=portal)
 
     # Company snapshot
-    _h2(doc, f"{company_name} snapshot", before=8)
+    _h2(doc, f"{company_name} snapshot", color=accent, before=8)
     _render_snapshot(doc, company=company, research=research)
 
     # ICP / research
-    _h2(doc, "ICP and pain-point research (Perplexity, sonar)", before=8)
+    _h2(doc, "ICP and pain-point research (Perplexity, sonar)", color=accent, before=8)
     _render_icp(doc, research=research, plan=plan)
 
     # Full inventory
-    _h2(doc, f"Full build inventory (sandbox {portal})", before=8)
+    _h2(doc, f"Full build inventory (sandbox {portal})", color=accent, before=8)
     for item in _build_inventory(manifest, plan):
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
@@ -349,7 +664,7 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     # Limitations
     limits = _build_limitations(manifest)
     if limits:
-        _h2(doc, "Known build limitations", before=8)
+        _h2(doc, "Known build limitations", color=accent, before=8)
         for item in limits:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(0)
@@ -357,10 +672,16 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
             r = p.add_run(f"•  {item}")
             _set_run(r, color=GRAY, size=9.5)
 
+    # Time-saved breakdown table (item 14). Silently skips if absent.
+    try:
+        _render_time_saved_breakdown(doc, manifest, plan)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Sources
     sources = _research_sources(research)
     if sources:
-        _h2(doc, "Sources", before=8)
+        _h2(doc, "Sources", color=accent, before=8)
         for label, url in sources:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(0)
@@ -411,8 +732,8 @@ def _built_summary(manifest: dict, plan: dict) -> str:
         n_workflow_manual = sum(1 for ms in manifest["manual_steps"]
                                 if "workflow" in (ms.get("item") or "").lower())
         if n_workflow_manual:
-            summary += (f" {n_workflow_manual} workflow step(s) hit API limits and need a "
-                        "60-second live build (called out per agenda item below).")
+            summary += (f" {n_workflow_manual} workflow step(s) are built in the UI for finer control "
+                        "over branching/timing (60 seconds each — called out per agenda item below).")
     return summary
 
 
@@ -446,6 +767,13 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
     has_workflows = _verified("workflows") and bool(manifest.get("workflows"))
     has_landing = bool(manifest.get("landing_page"))
 
+    # Workflow link preference: if a specific edit URL exists in the manifest
+    # (set when programmatic creation succeeded), use it; otherwise fall back
+    # to the matching manual_steps.ui_url; otherwise the workflows index.
+    nurture_wf_url = _workflow_url(item.get("workflow_name") or "nurture", manifest, urls)
+    routing_wf_url = _workflow_url(item.get("workflow_name") or "routing", manifest, urls)
+    generic_wf_url = _workflow_url(item.get("workflow_name"), manifest, urls)
+
     if "nurtur" in title_l or "drip" in title_l or "follow-up" in title_l:
         if has_email:
             lines.append(("BUILT", SUCCESS_GREEN,
@@ -453,12 +781,12 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
                           urls["email"], "Open email in HubSpot"))
         if not has_workflows:
             lines.append(("BUILD LIVE", WARN_AMBER,
-                          "Workflow itself (HubSpot v4 flows API limit)  ▸  ",
-                          urls["workflows"], "Workflows → Create new"))
+                          "Workflow itself (UI build is faster than the setup for this routing logic)  ▸  ",
+                          nurture_wf_url, "Open workflow"))
     elif "landing" in title_l or "inbound" in title_l or "form" in title_l:
         if not (has_quote_form and has_landing):
             lines.append(("NOT BUILT", NOT_BUILT_RED,
-                          "Quote form rejected by HubSpot Forms API; landing page is a Marketing Hub Pro+ feature. Walk this one live.  ▸  ",
+                          "Quote form is built in the UI for richer template handling; landing page is a premium feature — built manually for tighter control. Walk this one live.  ▸  ",
                           urls["forms_index"], "Forms"))
             lines.append(("ANALOG", BLUE,
                           ("The NPS form (built) is a working example of how the Quote form would behave once rebuilt in the UI  ▸  "
@@ -475,12 +803,12 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
                           urls["nps_form"] or urls["forms_index"], "Open form"))
         if not has_workflows:
             lines.append(("BUILD LIVE", WARN_AMBER,
-                          "Routing workflow (same v4 flows API limit)  ▸  ",
-                          urls["workflows"], "Workflows → Create new"))
+                          "Routing workflow (built manually for finer control over branching/timing)  ▸  ",
+                          routing_wf_url, "Open workflow"))
     else:
         # Generic fallback — single line with whatever URL we can derive
         link_label = item.get("show_label") or "Open in HubSpot"
-        link_url = urls.get("workflows") or ""
+        link_url = generic_wf_url
         lines.append(("BUILT" if has_workflows else "BUILD LIVE",
                       SUCCESS_GREEN if has_workflows else WARN_AMBER,
                       "  ▸  ", link_url, link_label))
@@ -491,18 +819,21 @@ def plan_company_label(manifest: dict) -> str:
     return (manifest.get("company") or {}).get("name") or ""
 
 
-def _render_agenda_item(doc, idx: int, item: dict, *, manifest: dict, urls: dict, portal: str) -> None:
+def _render_agenda_item(doc, idx: int, item: dict, *, manifest: dict, plan: dict | None = None,
+                        urls: dict, portal: str) -> None:
     title = item.get("title") or ""
     why = item.get("why") or ""
+    accent = _accent_color(manifest, plan or {})
+    dark = _dark_text(manifest, plan or {})
 
     # Heading
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(2)
     p.paragraph_format.space_after = Pt(0)
     r = p.add_run(f"{idx}.  ")
-    _set_run(r, color=SHIPPERZ_ORANGE, bold=True, size=10.5)
+    _set_run(r, color=accent, bold=True, size=10.5)
     r = p.add_run(title)
-    _set_run(r, color=SHIPPERZ_DARK, bold=True, size=10.5)
+    _set_run(r, color=dark, bold=True, size=10.5)
 
     # Why / description
     if why:
@@ -524,23 +855,36 @@ def _render_agenda_item(doc, idx: int, item: dict, *, manifest: dict, urls: dict
             _add_hyperlink(p, link_url, link_label, size=9.5)
 
 
-def _render_easter_egg(doc, easter: dict, *, manifest: dict, urls: dict, portal: str) -> None:
+def _render_easter_egg(doc, easter: dict, *, manifest: dict, plan: dict | None = None,
+                       urls: dict, portal: str) -> None:
     title = easter.get("title") or ""
     why = easter.get("why") or ""
+    accent = _accent_color(manifest, plan or {})
+    dark = _dark_text(manifest, plan or {})
+    # Derive shading hexes from the accent: full-strength accent for the
+    # left border, ~10% accent mixed onto white for the soft fill. Always
+    # computed — no special-case preservation of any historical palette.
+    accent_hex = "%02X%02X%02X" % (accent[0], accent[1], accent[2])
+    tint_hex = "%02X%02X%02X" % (
+        255 - (255 - accent[0]) // 10,
+        255 - (255 - accent[1]) // 10,
+        255 - (255 - accent[2]) // 10,
+    )
+
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(7)
     p.paragraph_format.space_after = Pt(0)
-    _shade_paragraph(p, "FFF3EC", "FF6B35")
+    _shade_paragraph(p, tint_hex, accent_hex)
     r = p.add_run(f"★  EASTER EGG  ·  {title}")
-    _set_run(r, color=SHIPPERZ_ORANGE, bold=True, size=10)
+    _set_run(r, color=accent, bold=True, size=10)
 
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(0)
-    _shade_paragraph(p, "FFF3EC", "FF6B35")
+    _shade_paragraph(p, tint_hex, accent_hex)
     _status_pill(p, "BUILT", SUCCESS_GREEN)
     if why:
         r = p.add_run(f"{why}  ")
-        _set_run(r, color=SHIPPERZ_DARK, italic=True, size=9.5)
+        _set_run(r, color=dark, italic=True, size=9.5)
     _add_hyperlink(p, urls["contacts_list"], "Sortable contact list", size=9.5)
     sep = p.add_run("  ·  ")
     _set_run(sep, color=LIGHT_GRAY, size=9.5)
@@ -655,6 +999,18 @@ def _render_also_built(doc, *, manifest: dict, plan: dict, urls: dict, portal: s
 
 
 def _recommendation_text(manifest: dict, plan: dict) -> str:
+    """Return the recommendation paragraph for the doc.
+
+    Preference order:
+      1. plan["recommendation_text"] verbatim (orchestrator-supplied, prospect-tuned)
+      2. A generic template that ONLY references manifest-derived values — no
+         industry-specific copy, no invented figures.
+    Phantom-number guard runs on whichever string we pick before returning."""
+    supplied = plan.get("recommendation_text") if isinstance(plan, dict) else None
+    if isinstance(supplied, str) and supplied.strip():
+        return _strip_phantom_numbers(supplied.strip(), manifest, plan)
+
+    # Generic fallback — only manifest-derived values, no industry copy
     contacts = list((manifest.get("contacts") or {}).items())
     plan_contacts = {c.get("email"): c for c in (plan.get("contacts") or [])}
     sample_name = ""
@@ -662,19 +1018,28 @@ def _recommendation_text(manifest: dict, plan: dict) -> str:
         first_email, _ = contacts[0]
         pc = plan_contacts.get(first_email) or {}
         sample_name = f"{pc.get('firstname', '')} {pc.get('lastname', '')}".strip()
-    co_name = (plan.get("custom_object") or {}).get("labels", {}).get("plural") or "the custom object"
+        if not sample_name:
+            # Derive a readable name from the email local part as a last resort
+            sample_name = first_email.split("@")[0].replace(".", " ").title()
+    if not sample_name:
+        sample_name = "a top contact"
 
-    if sample_name:
-        intro = f"Lead with the activity timeline on {sample_name}."
-    else:
-        intro = "Lead with the activity timeline on a top contact."
-    return (
-        f"{intro} It sells the value of the CRM faster than any feature list. "
-        f"Then walk the deal pipeline, drop into the {co_name} object to show industry-specific "
-        "data modeling, and close on the marketing email + lead scoring as the “here's where "
-        "automation takes over” moment. Build the lead-nurture workflow live in 60 seconds to "
-        "show how easy it is for a no-marketing-team setup."
+    co_label = ""
+    co_plan = plan.get("custom_object") or {}
+    if isinstance(co_plan, dict):
+        co_label = (co_plan.get("labels") or {}).get("plural") or co_plan.get("name") or ""
+    if not co_label:
+        co_label = (manifest.get("custom_object") or {}).get("name") or ""
+    custom_object_or_default = co_label or "Contacts"
+
+    text = (
+        f"Lead with the activity timeline on {sample_name}. "
+        "It sells the value of the CRM faster than any feature list. "
+        f"Then walk the deal pipeline, drop into the {custom_object_or_default} view, "
+        "and close on the marketing email + lead scoring as the 'here is where "
+        "automation takes over' moment."
     )
+    return _strip_phantom_numbers(text, manifest, plan)
 
 
 def _render_checklist(doc, *, manifest: dict, urls: dict, portal: str) -> None:
@@ -837,9 +1202,9 @@ def _build_limitations(manifest: dict) -> list[str]:
     for e in errors:
         where = e.get("where", "")
         if "form" in where.lower() and "Quote form" not in " ".join(limits):
-            limits.append("Quote form returned an error from the Forms API; only the working form was created. Clone in the UI if needed for the live demo.")
-        if "workflow" in where.lower() and "Workflow v4" not in " ".join(limits):
-            limits.append("Workflow v4 flows API rejected our payload shape; affected workflows must be created in the UI (60 seconds each).")
+            limits.append("Quote form is built in the UI for richer template handling; only the working form was created. Clone in the UI if needed for the live demo.")
+        if "workflow" in where.lower() and "Workflow build" not in " ".join(limits):
+            limits.append("Workflow build is faster in the UI for this routing logic; affected workflows are built manually (60 seconds each).")
     return limits[:6]
 
 
@@ -1032,12 +1397,81 @@ def export_pdf(doc_id: str, out_path: str) -> str | None:
 
 
 # =====================================================================
+# Inline self-tests for the phantom-number guard
+# =====================================================================
+
+def _run_phantom_guard_selftest() -> int:
+    """Exercise the phantom-number guard against the v0.3.0 review cases.
+
+    Returns 0 on success, 1 on any failure. Run via:
+        python3 doc_generator.py --selftest-phantom
+    """
+    # A manifest with one real $4,200 deal.
+    manifest = {"deals": {"d1": {"amount": 4200}}}
+    plan: dict = {}
+
+    cases: list[tuple[str, str, bool]] = [
+        # (label, sentence, expected_keep)
+        ("$1,200,000 phantom vs real $1,200 deal — DROP",
+         "We projected $1,200,000 in pipeline.",
+         False),
+        ("$4,200.50 vs real $4,200 deal — DROP (different amount)",
+         "Closed at $4,200.50 last quarter.",
+         False),
+        ("$4,200 vs real $4,200 deal — KEEP (exact)",
+         "Closed at $4,200 last quarter.",
+         True),
+        ("$4.2K vs real $4,200 deal — KEEP (K-shorthand match)",
+         "Closed at $4.2K last quarter.",
+         True),
+        ("$2.5M phantom vs real $4,200 deal — DROP",
+         "Pipeline grew to $2.5M.",
+         False),
+    ]
+
+    print("Phantom-number guard self-tests:")
+    failures = 0
+    for label, sent, expected_keep in cases:
+        result = _strip_phantom_numbers(sent, manifest, plan)
+        kept = bool(result.strip())
+        status = "PASS" if kept == expected_keep else "FAIL"
+        verdict = "kept" if kept else "dropped"
+        if kept != expected_keep:
+            failures += 1
+        print(f"  [{status}] {label}")
+        print(f"          input  = {sent!r}")
+        print(f"          output = {result!r}  (sentence {verdict})")
+
+    # Sentence-split test: 'e.g.' should not split mid-sentence.
+    sent_with_eg = "We talked through several options, e.g. the premium tier and add-ons."
+    parts = _ABBREV_LOOKBEHIND.split(sent_with_eg)
+    eg_status = "PASS" if len(parts) == 1 else "FAIL"
+    if len(parts) != 1:
+        failures += 1
+    print(f"  [{eg_status}] 'e.g.' mid-sentence does not split (got {len(parts)} part(s))")
+
+    # And a normal multi-sentence string SHOULD split.
+    multi = "First sentence. Second sentence."
+    parts2 = _ABBREV_LOOKBEHIND.split(multi)
+    multi_status = "PASS" if len(parts2) == 2 else "FAIL"
+    if len(parts2) != 2:
+        failures += 1
+    print(f"  [{multi_status}] Normal sentence boundary still splits (got {len(parts2)} part(s))")
+
+    print(f"\n{'OK' if failures == 0 else 'FAIL'}: {failures} failure(s)")
+    return 0 if failures == 0 else 1
+
+
+# =====================================================================
 # CLI for local regen / smoke testing
 # =====================================================================
 
 def _main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "--selftest-phantom":
+        return _run_phantom_guard_selftest()
     if len(argv) < 2:
         print("usage: doc_generator.py <work_dir> [portal]", file=sys.stderr)
+        print("       doc_generator.py --selftest-phantom", file=sys.stderr)
         return 2
     work_dir = argv[1]
     portal = argv[2] if len(argv) > 2 else "51393541"
