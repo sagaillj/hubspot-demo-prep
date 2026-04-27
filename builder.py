@@ -280,6 +280,8 @@ class Builder:
             "calc_property": {},       # {name, group}
             "campaign_id": None,
             "campaign_url": None,
+            # phase_name -> {verified: bool, retried: bool, message: str}
+            "verifications": {},
         }
         random.seed(42)
 
@@ -799,12 +801,30 @@ class Builder:
                 ok(f"reusing form {fp['name']}")
             else:
                 # Split fields into groups of max 3 (HubSpot constraint)
-                all_fields = [{"objectTypeId": "0-1", "name": fld["name"],
-                              "label": fld["label"], "required": fld.get("required", False),
-                              "hidden": False,
-                              "fieldType": DEFAULT_CONTACT_FIELD_TYPES.get(
-                                  fld["name"], fld.get("field_type", "single_line_text"))}
-                             for fld in fp["fields"]]
+                # HubSpot Forms v3 requires every field to carry a `validation` object.
+                # Email fields use blocked-domain settings; everything else gets the no-op
+                # default. The error message "required fields were not set: [validation]"
+                # is what failed previously when the key was omitted.
+                def _validation(field_name: str, ftype: str) -> dict:
+                    if ftype == "email":
+                        return {
+                            "blockedEmailDomains": [],
+                            "useDefaultBlockList": False,
+                        }
+                    return {}
+                all_fields = []
+                for fld in fp["fields"]:
+                    ftype = DEFAULT_CONTACT_FIELD_TYPES.get(
+                        fld["name"], fld.get("field_type", "single_line_text"))
+                    all_fields.append({
+                        "objectTypeId": "0-1",
+                        "name": fld["name"],
+                        "label": fld["label"],
+                        "required": fld.get("required", False),
+                        "hidden": False,
+                        "fieldType": ftype,
+                        "validation": _validation(fld["name"], ftype),
+                    })
                 groups = [{"groupType": "default_group", "richTextType": "text",
                            "fields": all_fields[i:i+3]} for i in range(0, len(all_fields), 3)]
                 now = datetime.datetime.utcnow().isoformat() + "Z"
@@ -874,22 +894,33 @@ class Builder:
         ok(f"scores set: {ok_count}/{len(self.manifest['contacts'])}")
         self.manifest["lead_scoring"] = {"property": "demo_lead_score", "backfilled": ok_count}
 
-        # Hot list with dedup
+        # Hot list with dedup. Use HubSpot's GET-by-name endpoint (the list-all endpoint
+        # response shape is inconsistent and the prior heuristic failed silently).
         list_name = f"Demo: Hot leads by score ({self.slug})"
-        # Look for existing list
-        s, r = self.client.request("GET", "/crm/v3/lists", query={"objectTypeId": "0-1"})
         list_id = None
+        encoded = urllib.parse.quote(list_name, safe="")
+        s, r = self.client.request("GET", f"/crm/v3/lists/object-type-id/0-1/name/{encoded}")
         if self.client.is_ok(s):
-            for lst in r.get("lists", []) or r.get("results", []):
-                if lst.get("name") == list_name:
-                    list_id = lst.get("listId") or lst.get("id")
-                    break
+            payload = r.get("list", r) or {}
+            list_id = payload.get("listId") or payload.get("id")
         if not list_id:
             body = {"name": list_name, "objectTypeId": "0-1", "processingType": "MANUAL"}
             s, r = self.client.request("POST", "/crm/v3/lists", body)
             if self.client.is_ok(s):
                 list_id = r.get("list", {}).get("listId") or r.get("listId") or r.get("id")
                 ok(f"hot leads list → {list_id}")
+            elif s == 400 and "already exist" in str(r).lower():
+                # Race / stale state. Re-query by name to recover the existing id.
+                s2, r2 = self.client.request("GET", f"/crm/v3/lists/object-type-id/0-1/name/{encoded}")
+                if self.client.is_ok(s2):
+                    payload = r2.get("list", r2) or {}
+                    list_id = payload.get("listId") or payload.get("id")
+                if list_id:
+                    ok(f"hot leads list (reused existing) → {list_id}")
+                else:
+                    warn(f"hot leads list: 400 'already exists' but lookup failed: {str(r2)[:200]}")
+                    self.add_error("hot_leads_list", s, r)
+                    return
             else:
                 warn(f"hot leads list: {s} {str(r)[:200]}")
                 self.add_error("hot_leads_list", s, r)
@@ -1210,12 +1241,42 @@ class Builder:
 
         # Pre-flight: ensure demo_customer property exists on the leads object.
         # The Properties endpoint takes the friendly name "leads", not the type id "0-136".
+        # The leads object's default group name varies by portal — discover it via GET first.
+        skip_demo_customer = False
+        group_name = None
+        sg, rg = self.client.request("GET", "/crm/v3/properties/leads/groups")
+        if self.client.is_ok(sg):
+            groups = rg.get("results", []) or []
+            preferred = ("leadinformation", "lead_information", "leads_information")
+            for g in groups:
+                if g.get("name") in preferred:
+                    group_name = g["name"]
+                    break
+            if not group_name and groups:
+                # Fall back to the first group with a name; prefer non-hidden if the field exists.
+                visible = [g for g in groups if not g.get("hidden", False)]
+                pool = visible or groups
+                for g in pool:
+                    if g.get("name"):
+                        group_name = g["name"]
+                        break
+        elif sg == 404:
+            warn("leads object not available (404) — Sales Hub Pro+ required, skipping phase")
+            self.add_manual_step(
+                "Sales Workspace leads",
+                f"https://app.hubspot.com/sales-workspace/{self.portal}",
+                "Sales Hub Pro+ required for the Leads object. Create leads manually if needed.",
+                "Sales Hub Pro+ required for Leads object",
+            )
+            return
+
         prop_body = {
             "name": "demo_customer", "label": "Demo Customer Slug",
-            "type": "string", "fieldType": "text", "groupName": "leadinformation",
+            "type": "string", "fieldType": "text",
             "description": "Tags demo data created by hubspot-demo-prep skill.",
         }
-        skip_demo_customer = False
+        if group_name:
+            prop_body["groupName"] = group_name
         s, r = self.client.request("POST", "/crm/v3/properties/leads", prop_body)
         if s == 409:
             pass  # already exists — fine
@@ -1233,16 +1294,11 @@ class Builder:
             self.add_error("lead.property.preflight", s, r)
             skip_demo_customer = True
         elif not self.client.is_ok(s):
-            # Try once more without groupName (some portals don't have leadinformation group).
-            warn(f"leads property pre-flight {s}; retrying without groupName")
-            fallback = {k: v for k, v in prop_body.items() if k != "groupName"}
-            s2, r2 = self.client.request("POST", "/crm/v3/properties/leads", fallback)
-            if s2 == 409 or self.client.is_ok(s2):
-                ok("leads demo_customer property created (default group)")
-            else:
-                warn(f"leads property fallback also failed: {s2} {str(r2)[:200]}")
-                self.add_error("lead.property.preflight", s2, r2)
-                skip_demo_customer = True
+            warn(f"leads property pre-flight {s} (group={group_name!r}); leads will be created without demo_customer tag")
+            self.add_error("lead.property.preflight", s, r)
+            skip_demo_customer = True
+        else:
+            ok(f"leads demo_customer property created (group={group_name or 'default'})")
 
         labels = ["WARM", "HOT", "COLD"]
         sources = ["Web form", "Inbound call", "LinkedIn outreach",
@@ -1591,6 +1647,7 @@ class Builder:
             "hs_utm": "utm_source=hubspot&utm_medium=email&utm_campaign=snowbird_q1_2026",
         }}
 
+        campaign_name = body["properties"]["hs_name"]
         s, r = self.client.request("POST", "/marketing/v3/campaigns", body)
         if s in (401, 403):
             warn(f"campaign blocked ({s}) — likely missing marketing.campaigns.write")
@@ -1601,7 +1658,32 @@ class Builder:
                 "Token missing marketing.campaigns.write scope (enforced 2026-07-09)",
             )
             return
-        if not self.client.is_ok(s):
+        if s == 409 or (s == 400 and "already exist" in str(r).lower()):
+            # Re-query by name and reuse the existing campaign. The list endpoint
+            # filters server-side via ?name=, but each result's `properties` dict
+            # is empty (HubSpot only populates properties on individual GETs).
+            # If exactly one result comes back, that's our match.
+            sl, rl = self.client.request("GET", "/marketing/v3/campaigns",
+                                         query={"limit": 100, "name": campaign_name})
+            existing = None
+            if self.client.is_ok(sl):
+                results = rl.get("results", []) or []
+                if rl.get("total") == 1 and results:
+                    existing = results[0]
+                else:
+                    for c in results:
+                        cname = (c.get("properties") or {}).get("hs_name") or c.get("name")
+                        if cname == campaign_name:
+                            existing = c
+                            break
+            if existing:
+                r = existing
+                ok(f"campaign reused (already existed): {campaign_name!r}")
+            else:
+                warn(f"campaign create 409 but lookup failed: {str(rl)[:200]}")
+                self.add_error("campaign.create", s, r)
+                return
+        elif not self.client.is_ok(s):
             warn(f"campaign create: {s} {str(r)[:200]}")
             self.add_error("campaign.create", s, r)
             return
@@ -1670,27 +1752,293 @@ class Builder:
             ok(f"demo doc → {docx_path} (Drive upload skipped)")
         return self.manifest["demo_doc"]
 
+    # ---- Verification loop ----
+    # After each create_* phase, GET back at least one representative artifact
+    # and confirm key fields are populated. If verification fails AND the phase
+    # produced no artifacts at all, re-run the create once. Final result lands
+    # in manifest["verifications"][<phase>] so the demo doc renders [NOT_BUILT]
+    # for any phase that didn't actually land in HubSpot.
+
+    def _record_verify(self, name: str, verified: bool, retried: bool, message: str) -> None:
+        self.manifest["verifications"][name] = {
+            "verified": verified, "retried": retried, "message": message,
+        }
+        if verified:
+            ok(f"verify {name}: {message}")
+        else:
+            warn(f"verify {name} FAILED ({'retried' if retried else 'no retry'}): {message}")
+
+    def _run_with_verify(self, name: str, create_fn, verify_fn, *,
+                         is_empty_fn=None) -> None:
+        """Run a create phase, then verify. Retry once if verify fails AND nothing
+        was created (avoids duplicates from partially successful phases).
+
+        verify_fn returns (verified: bool, message: str). Returning verified=True with
+        a "skipped" message indicates the phase had nothing to build per the plan.
+        """
+        try:
+            create_fn()
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001 — outer safety net
+            self._record_verify(name, False, False, f"create raised {type(exc).__name__}: {exc}")
+            return
+        try:
+            verified, msg = verify_fn()
+        except Exception as exc:  # noqa: BLE001
+            verified, msg = False, f"verify raised {type(exc).__name__}: {exc}"
+        if verified:
+            self._record_verify(name, True, False, msg)
+            return
+        empty_ok_to_retry = is_empty_fn is None or is_empty_fn()
+        if not empty_ok_to_retry:
+            self._record_verify(name, False, False,
+                                f"{msg}; partial artifacts present, not retrying")
+            return
+        log(f"  ↻ retrying {name} (verify failed, nothing created yet)")
+        try:
+            create_fn()
+            verified, msg = verify_fn()
+        except Exception as exc:  # noqa: BLE001
+            verified, msg = False, f"retry raised {type(exc).__name__}: {exc}"
+        self._record_verify(name, verified, True, msg)
+
+    def _get_first(self, mapping: dict):
+        for v in (mapping or {}).values():
+            return v
+        return None
+
+    def verify_company(self) -> tuple[bool, str]:
+        cid = (self.manifest.get("company") or {}).get("id")
+        if not cid:
+            return False, "no company id in manifest"
+        s, r = self.client.request("GET", f"/crm/v3/objects/companies/{cid}",
+                                   query={"properties": "name,domain,industry"})
+        if not self.client.is_ok(s):
+            return False, f"GET company {cid} returned {s}"
+        name = (r.get("properties") or {}).get("name")
+        return (bool(name), f"company id={cid} name={name!r}")
+
+    def verify_contacts(self) -> tuple[bool, str]:
+        cid = self._get_first(self.manifest.get("contacts"))
+        if not cid:
+            return False, "no contacts in manifest"
+        s, r = self.client.request("GET", f"/crm/v3/objects/contacts/{cid}",
+                                   query={"properties": "email,firstname,lastname"})
+        if not self.client.is_ok(s):
+            return False, f"GET contact {cid} returned {s}"
+        email = (r.get("properties") or {}).get("email")
+        return (bool(email), f"{len(self.manifest['contacts'])} contacts (sample {email!r})")
+
+    def verify_leads(self) -> tuple[bool, str]:
+        leads = self.manifest.get("leads") or {}
+        if not leads:
+            # Sales Hub Pro+ gating may legitimately yield zero leads.
+            if any(ms.get("item") == "Sales Workspace leads"
+                   for ms in self.manifest.get("manual_steps", [])):
+                return True, "skipped — Sales Hub gating logged as manual_step"
+            return False, "no leads created"
+        lid = self._get_first(leads)
+        s, r = self.client.request("GET", f"/crm/v3/objects/0-136/{lid}",
+                                   query={"properties": "hs_lead_name,hs_lead_label"})
+        if not self.client.is_ok(s):
+            return False, f"GET lead {lid} returned {s}"
+        return True, f"{len(leads)} leads (sample {(r.get('properties') or {}).get('hs_lead_name')!r})"
+
+    def verify_pipeline_and_deals(self) -> tuple[bool, str]:
+        deals = self.manifest.get("deals") or {}
+        if not deals:
+            return False, "no deals created"
+        did = self._get_first(deals)
+        s, r = self.client.request("GET", f"/crm/v3/objects/deals/{did}",
+                                   query={"properties": "dealname,amount,pipeline,dealstage"})
+        if not self.client.is_ok(s):
+            return False, f"GET deal {did} returned {s}"
+        props = r.get("properties") or {}
+        return (bool(props.get("dealname") and props.get("pipeline")),
+                f"{len(deals)} deals on pipeline {props.get('pipeline')}")
+
+    def verify_tickets(self) -> tuple[bool, str]:
+        if not self.plan.get("tickets"):
+            return True, "skipped — no tickets in plan"
+        tickets = self.manifest.get("tickets") or {}
+        if not tickets:
+            return False, "tickets in plan but none created"
+        tid = self._get_first(tickets)
+        s, r = self.client.request("GET", f"/crm/v3/objects/tickets/{tid}",
+                                   query={"properties": "subject,hs_pipeline_stage"})
+        if not self.client.is_ok(s):
+            return False, f"GET ticket {tid} returned {s}"
+        return True, f"{len(tickets)} tickets (sample {(r.get('properties') or {}).get('subject')!r})"
+
+    def verify_engagements(self) -> tuple[bool, str]:
+        n = self.manifest.get("engagements_count", 0)
+        if n == 0:
+            return False, "no engagements created"
+        return True, f"{n} engagements logged"
+
+    def verify_custom_object(self) -> tuple[bool, str]:
+        co = self.manifest.get("custom_object") or {}
+        type_id = co.get("object_type_id") or co.get("id")
+        if not type_id:
+            if not self.plan.get("custom_object"):
+                return True, "skipped — not in plan"
+            return False, "custom object missing from manifest"
+        s, r = self.client.request("GET", f"/crm/v3/schemas/{type_id}")
+        if not self.client.is_ok(s):
+            return False, f"GET schema {type_id} returned {s}"
+        return True, f"schema {co.get('name')} → {type_id}"
+
+    def verify_custom_events(self) -> tuple[bool, str]:
+        if not self.plan.get("custom_events"):
+            return True, "skipped — not in plan"
+        events = self.manifest.get("custom_events") or {}
+        return (bool(events), f"{len(events)} event def(s) recorded" if events
+                else "events in plan but none recorded")
+
+    def verify_forms(self) -> tuple[bool, str]:
+        if not self.plan.get("forms"):
+            return True, "skipped — no forms in plan"
+        forms = self.manifest.get("forms") or {}
+        if not forms:
+            return False, "forms in plan but none created"
+        guid = self._get_first(forms)
+        s, r = self.client.request("GET", f"/marketing/v3/forms/{guid}")
+        if not self.client.is_ok(s):
+            return False, f"GET form {guid} returned {s}"
+        groups = r.get("fieldGroups", []) or []
+        field_count = sum(len(g.get("fields", []) or []) for g in groups)
+        return (field_count > 0, f"{len(forms)} form(s) (sample has {field_count} field(s))")
+
+    def verify_lead_scoring(self) -> tuple[bool, str]:
+        ls = self.manifest.get("lead_scoring") or {}
+        if not ls.get("backfilled"):
+            return False, "no lead scores backfilled"
+        cid = self._get_first(self.manifest.get("contacts"))
+        if not cid:
+            return False, "no contact to spot-check"
+        s, r = self.client.request("GET", f"/crm/v3/objects/contacts/{cid}",
+                                   query={"properties": "demo_lead_score"})
+        if not self.client.is_ok(s):
+            return False, f"GET contact {cid} returned {s}"
+        score = (r.get("properties") or {}).get("demo_lead_score")
+        return (bool(score), f"{ls.get('backfilled')} scored (sample contact={score})")
+
+    def verify_marketing_email(self) -> tuple[bool, str]:
+        em = self.manifest.get("marketing_email") or {}
+        eid = em.get("id")
+        if not eid:
+            return False, "no marketing email id"
+        s, r = self.client.request("GET", f"/marketing/v3/emails/{eid}")
+        if not self.client.is_ok(s):
+            return False, f"GET email {eid} returned {s}"
+        return (bool(r.get("subject") or r.get("name")),
+                f"email {eid} subject={r.get('subject')!r}")
+
+    def verify_workflows(self) -> tuple[bool, str]:
+        wanted = self.plan.get("workflows") or []
+        wf = self.manifest.get("workflows") or {}
+        if not wanted:
+            return True, "skipped — no workflows in plan"
+        if not wf:
+            return False, f"{len(wanted)} workflow(s) in plan but none created"
+        wid = self._get_first(wf)
+        # v4 flows API: GET /automation/v4/flows/{id}
+        s, r = self.client.request("GET", f"/automation/v4/flows/{wid}")
+        if not self.client.is_ok(s):
+            # v3 fallback
+            s, r = self.client.request("GET", f"/automation/v3/workflows/{wid}")
+        if not self.client.is_ok(s):
+            return False, f"GET workflow {wid} returned {s}"
+        return True, f"{len(wf)} workflow(s) (sample id={wid})"
+
+    def verify_quotes(self) -> tuple[bool, str]:
+        if not self.plan.get("quotes") and not self.manifest.get("quotes"):
+            return True, "skipped — not in plan"
+        quotes = self.manifest.get("quotes") or {}
+        if not quotes:
+            return False, "no quotes created"
+        qid = self._get_first(quotes)
+        s, r = self.client.request("GET", f"/crm/v3/objects/quotes/{qid}",
+                                   query={"properties": "hs_title,hs_status"})
+        if not self.client.is_ok(s):
+            return False, f"GET quote {qid} returned {s}"
+        return True, f"{len(quotes)} quote(s) (sample status={(r.get('properties') or {}).get('hs_status')})"
+
+    def verify_invoices(self) -> tuple[bool, str]:
+        if not self.plan.get("invoices") and not self.manifest.get("invoices"):
+            return True, "skipped — not in plan"
+        invs = self.manifest.get("invoices") or {}
+        if not invs:
+            return False, "no invoices created"
+        iid = self._get_first(invs)
+        s, r = self.client.request("GET", f"/crm/v3/objects/invoices/{iid}",
+                                   query={"properties": "hs_status,hs_invoice_amount_due"})
+        if not self.client.is_ok(s):
+            return False, f"GET invoice {iid} returned {s}"
+        return True, f"{len(invs)} invoice(s) (sample status={(r.get('properties') or {}).get('hs_status')})"
+
+    def verify_calc_property_and_group(self) -> tuple[bool, str]:
+        cp = self.manifest.get("calc_property") or {}
+        prop_name = cp.get("name") or "deal_age_days"
+        s, r = self.client.request("GET", f"/crm/v3/properties/deals/{prop_name}")
+        if not self.client.is_ok(s):
+            return False, f"GET property deals/{prop_name} returned {s}"
+        return True, f"calc property {prop_name} present (group={r.get('groupName')})"
+
+    def verify_marketing_campaign(self) -> tuple[bool, str]:
+        cid = self.manifest.get("campaign_id")
+        if not cid:
+            # Defensive 403 fallback path may have logged manual_step.
+            if any("campaign" in (ms.get("item", "").lower())
+                   for ms in self.manifest.get("manual_steps", [])):
+                return True, "skipped — campaigns scope unavailable, manual_step logged"
+            return False, "no campaign id in manifest"
+        s, r = self.client.request("GET", f"/marketing/v3/campaigns/{cid}")
+        if not self.client.is_ok(s):
+            return False, f"GET campaign {cid} returned {s}"
+        return True, f"campaign {cid} name={r.get('properties', {}).get('hs_name') or r.get('name')!r}"
+
     # ---- Run ----
 
     def run(self) -> dict:
         self.preflight_scopes(strict=True)
         self.ensure_properties()
-        self.create_company()
-        self.create_contacts()
-        self.create_leads()                       # v2 — after contacts
-        self.create_pipeline_and_deals()
-        self.create_tickets()
-        self.create_engagements()
-        self.create_custom_object()
-        self.create_custom_events()
-        self.create_forms()
-        self.lead_scoring()
-        self.marketing_email()
-        self.workflows()
-        self.create_quotes()                      # v2 — after deals
-        self.create_invoices()                    # v2 — after quotes (reuses line items)
-        self.create_calc_property_and_group()     # v2 — after deals exist
-        self.create_marketing_campaign()          # v2 — after email + form
+        self._run_with_verify("company", self.create_company, self.verify_company,
+                              is_empty_fn=lambda: not self.manifest.get("company", {}).get("id"))
+        self._run_with_verify("contacts", self.create_contacts, self.verify_contacts,
+                              is_empty_fn=lambda: not self.manifest.get("contacts"))
+        self._run_with_verify("leads", self.create_leads, self.verify_leads,
+                              is_empty_fn=lambda: not self.manifest.get("leads"))
+        self._run_with_verify("pipeline_and_deals", self.create_pipeline_and_deals,
+                              self.verify_pipeline_and_deals,
+                              is_empty_fn=lambda: not self.manifest.get("deals"))
+        self._run_with_verify("tickets", self.create_tickets, self.verify_tickets,
+                              is_empty_fn=lambda: not self.manifest.get("tickets"))
+        self._run_with_verify("engagements", self.create_engagements, self.verify_engagements,
+                              is_empty_fn=lambda: self.manifest.get("engagements_count", 0) == 0)
+        self._run_with_verify("custom_object", self.create_custom_object, self.verify_custom_object,
+                              is_empty_fn=lambda: not (self.manifest.get("custom_object") or {}).get("object_type_id"))
+        self._run_with_verify("custom_events", self.create_custom_events, self.verify_custom_events,
+                              is_empty_fn=lambda: not self.manifest.get("custom_events"))
+        self._run_with_verify("forms", self.create_forms, self.verify_forms,
+                              is_empty_fn=lambda: not self.manifest.get("forms"))
+        self._run_with_verify("lead_scoring", self.lead_scoring, self.verify_lead_scoring,
+                              is_empty_fn=lambda: not (self.manifest.get("lead_scoring") or {}).get("backfilled"))
+        self._run_with_verify("marketing_email", self.marketing_email, self.verify_marketing_email,
+                              is_empty_fn=lambda: not (self.manifest.get("marketing_email") or {}).get("id"))
+        self._run_with_verify("workflows", self.workflows, self.verify_workflows,
+                              is_empty_fn=lambda: not self.manifest.get("workflows"))
+        self._run_with_verify("quotes", self.create_quotes, self.verify_quotes,
+                              is_empty_fn=lambda: not self.manifest.get("quotes"))
+        self._run_with_verify("invoices", self.create_invoices, self.verify_invoices,
+                              is_empty_fn=lambda: not self.manifest.get("invoices"))
+        self._run_with_verify("calc_property_and_group", self.create_calc_property_and_group,
+                              self.verify_calc_property_and_group,
+                              is_empty_fn=lambda: not self.manifest.get("calc_property"))
+        self._run_with_verify("marketing_campaign", self.create_marketing_campaign,
+                              self.verify_marketing_campaign,
+                              is_empty_fn=lambda: not self.manifest.get("campaign_id"))
         self.save_manifest()
         doc = self.generate_doc()
         self.save_manifest()
@@ -1716,6 +2064,12 @@ class Builder:
         log(f"  Campaign: {self.manifest['campaign_id'] or 'not created'}")
         log(f"  Manual steps: {len(self.manifest['manual_steps'])}")
         log(f"  Errors: {len(self.manifest['errors'])}")
+        verifs = self.manifest.get("verifications", {}) or {}
+        verif_ok = sum(1 for v in verifs.values() if v.get("verified"))
+        log(f"  Verified: {verif_ok}/{len(verifs)} phases")
+        unverified = [k for k, v in verifs.items() if not v.get("verified")]
+        if unverified:
+            log(f"    unverified: {', '.join(unverified)}")
         log("=" * 60)
         return doc
 

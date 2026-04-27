@@ -425,12 +425,25 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
     lines: list[tuple[str, RGBColor, str, str, str]] = []
     title_l = (item.get("title") or "").lower()
 
+    # Verification gate — a manifest entry alone isn't enough. The builder may have
+    # recorded an artifact, but the post-create GET could have shown the artifact
+    # never landed. Treat unverified phases as not built so the doc never claims
+    # something is live that the rep can't actually open.
+    verifications = manifest.get("verifications") or {}
+    def _verified(phase: str) -> bool:
+        v = verifications.get(phase)
+        if v is None:
+            return True  # legacy manifests without verifications keep prior behavior
+        return bool(v.get("verified"))
+
     forms = manifest.get("forms") or {}
-    has_nps = any("nps" in n.lower() for n in forms)
-    has_quote_form = any("quote" in n.lower() for n in forms)
-    has_email = bool((manifest.get("marketing_email") or {}).get("name")
-                     or (manifest.get("marketing_email") or {}).get("html_path"))
-    has_workflows = bool(manifest.get("workflows"))
+    forms_ok = _verified("forms")
+    has_nps = forms_ok and any("nps" in n.lower() for n in forms)
+    has_quote_form = forms_ok and any("quote" in n.lower() for n in forms)
+    has_email = (_verified("marketing_email")
+                 and bool((manifest.get("marketing_email") or {}).get("name")
+                          or (manifest.get("marketing_email") or {}).get("html_path")))
+    has_workflows = _verified("workflows") and bool(manifest.get("workflows"))
     has_landing = bool(manifest.get("landing_page"))
 
     if "nurtur" in title_l or "drip" in title_l or "follow-up" in title_l:

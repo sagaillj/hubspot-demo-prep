@@ -224,3 +224,108 @@ Today's outstanding work:
 
 Sandbox 51393541. Last build manifest: /tmp/demo-prep-shipperzinc/manifest.json.
 ```
+
+---
+
+## v4 session — 2026-04-26 late evening
+
+### What landed
+
+1. **Verification loop** (~190 lines) per Jeremy's mandate. After every `create_*`,
+   `verify_*` does a targeted GET, checks key fields, and writes
+   `manifest["verifications"][phase] = {verified, retried, message}`. If a phase's
+   verify fails AND nothing was created, `_run_with_verify` retries the create once
+   (avoids duplicate side-effects on partial successes). Wired into `Builder.run()`
+   for all 16 create phases. Build summary now ends with `Verified: X/Y phases` and
+   lists any unverified phases by name.
+
+2. **doc_generator integrates verifications.** `_agenda_status_lines` now AND-gates
+   "is built" booleans against `manifest["verifications"][phase].verified`, so a
+   phase that didn't actually land in HubSpot can't render `[BUILT]` in the doc.
+   Falls back to legacy heuristics if `verifications` is absent (older manifests).
+
+3. **Quote form 400 (`required: [validation]`) — fixed.** Each form field now
+   carries a `validation` object. Email fields get
+   `{blockedEmailDomains: [], useDefaultBlockList: false}`; everything else gets
+   `{}`. Live test: form `Shipperz Quote Request (Demo)` now creates clean.
+
+4. **Hot leads list 400 "already exists" — fixed.** Switched from
+   `GET /crm/v3/lists?objectTypeId=0-1` (which silently returned no match) to
+   `GET /crm/v3/lists/object-type-id/0-1/name/{urlencoded-name}` for the dedup
+   lookup. Added a 400 fallback that re-queries by name if the create races.
+
+5. **Leads property pre-flight 400 — fixed.** Now `GET /crm/v3/properties/leads/groups`
+   first to discover the actual group name (this portal: `lead_information`, not
+   `leadinformation`). Falls back to first non-hidden group if the preferred
+   names aren't present.
+
+6. **Marketing campaign 409 — fixed.** Same reuse pattern: on 409 or 400-already-exists,
+   `GET /marketing/v3/campaigns?name=<name>`. The list endpoint returns matching
+   campaigns with empty `properties` (HubSpot only populates on individual GETs),
+   so we use the result directly when `total == 1`.
+
+### Live test results (`build-api-run-5.log`, 2026-04-26 21:13)
+
+```
+Errors: 4  (was 5 last session, was 19 the session before)
+Verified: 15/16 phases
+unverified: workflows  (HubSpot v4 flows API 500 — Playwright is the fallback)
+demo doc → https://docs.google.com/document/d/13W2ooC7VqpmWfVd5BR89ZOqnAtjbg_lE86WkkTlmStU/edit
+```
+
+All major phases now verified: company, contacts, leads, deals, tickets, engagements,
+custom_object, custom_events, forms, lead_scoring, marketing_email, quotes, invoices,
+calc_property_and_group, marketing_campaign. ~95s API-only build.
+
+### Still open / next session
+
+1. **Run `python3 builder.py shipperzinc --playwright --first-run`.** Playwright
+   phases handle workflows + branding + saved views via UI. Needs Chrome login on
+   first run; storage-state cached at `state/{slug}-hubspot.json` after that.
+   Will close the `workflows` unverified gap.
+
+2. **Form submissions stuck at 0/8 + 0/6.** Pre-existing bug, not on this
+   session's priority list. The form-submit endpoint returns non-200 for every
+   submission body. Likely a content-type / form-context payload issue. Cosmetic
+   for the demo (rep walks the form live).
+
+3. **Wrap as Claude Code plugin** — `.claude-plugin/plugin.json` +
+   `marketing.json` + `git init` + GitHub repo. Distribution-ready packaging.
+
+4. **Workflow v4 actionTypeId** — `0-2` and `0-5` both 500. Either probe
+   `GET /automation/v4/actionTypes` or commit to template-clone (clone an
+   existing UI-built workflow body shape). Playwright UI fallback is the
+   realistic path for Friday.
+
+5. **Drive 403 quota** — sometimes hits "Queries per minute" limit on rapid
+   reruns. Non-blocking; .docx still saves locally. Could add exponential backoff
+   in `doc_generator.upload_to_drive` if it becomes a recurring issue.
+
+### Files touched this session
+
+- `builder.py` — +220 lines (verifications + 4 bug fixes), still imports clean
+- `doc_generator.py` — verification gate in `_agenda_status_lines`
+- No changes to `playwright_phases.py`, `playwright_phases_extras.py`,
+  `helpers/banner.sh`, or the locked Shipperz GDoc
+
+### Paste-ready re-prompt for next session
+
+```
+Resuming hubspot-demo-prep. Read ~/.claude/skills/hubspot-demo-prep/HANDOFF.md
+"v4 session" section — that's the latest state.
+
+15/16 phases verified on the API path. Only workflows unverified (HubSpot v4 flows
+API 500). Verification loop is running per Jeremy's spec, doc renders [NOT_BUILT]
+for unverified phases.
+
+Today:
+1. Run `python3 builder.py shipperzinc --playwright --first-run`. Watch selector
+   breakages, screenshot every flow. Closes the workflows gap.
+2. Wrap as Claude Code plugin (.claude-plugin/plugin.json + marketing.json +
+   git init + GitHub repo) for distribution.
+3. (Optional) Investigate form submissions 0/n — submission-API content-type or
+   form-context payload issue.
+
+Sandbox 51393541. Last manifest: /tmp/demo-prep-shipperzinc/manifest.json.
+Latest demo doc: https://docs.google.com/document/d/13W2ooC7VqpmWfVd5BR89ZOqnAtjbg_lE86WkkTlmStU/edit
+```
