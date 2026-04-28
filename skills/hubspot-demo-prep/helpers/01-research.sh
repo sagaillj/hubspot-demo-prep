@@ -54,6 +54,7 @@ FIRECRAWL_OUT="$WORK/firecrawl.json"
 SCREENSHOT="$WORK/homepage.png"
 DOM_DUMP="$WORK/dom.json"
 PERPLEXITY_OUT="$WORK/perplexity.json"
+LOGO_OUT="$WORK/logo.png"
 
 # ---- Build the Playwright script up-front so it's ready to launch ----
 cat > "$WORK/playwright-script.js" <<EOF
@@ -122,6 +123,78 @@ else
   warn "  Playwright not available, skipping screenshot"
 fi
 
+# ---- Always-on Playwright logo screenshot (Fix F-research, 2026-04-26) ----
+# Jeremy's spec: always run Playwright for the logo. Don't trust Firecrawl's
+# branding pull — it returns og:image which is often a hero photo, not a
+# transparent logo. The marketing email + doc + form all reference this
+# logo path, so its reliability is load-bearing for "feels brand-consistent".
+LOGO_PID=""
+if python3 -c "import playwright" >/dev/null 2>&1; then
+  COMPANY_NAME_GUESS="$DOMAIN"
+  ( python3 - "$URL" "$LOGO_OUT" "$COMPANY_NAME_GUESS" \
+      > "$WORK/logo-playwright.log" 2>&1 <<'PY'
+import sys
+from playwright.sync_api import sync_playwright
+
+url = sys.argv[1]
+out_path = sys.argv[2]
+company_hint = (sys.argv[3] if len(sys.argv) > 3 else "").lower()
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    page = browser.new_page(viewport={"width": 1440, "height": 900})
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        print(f"PLAYWRIGHT_GOTO_FAIL: {exc}", file=sys.stderr)
+        browser.close()
+        sys.exit(2)
+
+    # Priority: explicit alt-text logo > header anchor logo > nav logo >
+    # .logo class > BEM-style header__logo > first img in header/nav >
+    # alt matching company name. The first matching, visible element wins.
+    selectors = [
+        "header img[alt*='logo' i]",
+        "header a[href='/'] img",
+        "nav img[alt*='logo' i]",
+        ".logo img",
+        ".header__logo img",
+        f"img[alt*='{company_hint}' i]" if company_hint else None,
+        "header img:first-of-type",
+        "nav img:first-of-type",
+    ]
+    selectors = [s for s in selectors if s]
+
+    found = None
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el and el.is_visible():
+                found = el
+                break
+        except Exception:
+            continue
+
+    try:
+        if found:
+            found.screenshot(path=out_path, omit_background=True)
+            print(f"OK: logo saved to {out_path}", file=sys.stderr)
+        else:
+            # Fallback: top-left 400x120 region (most logos sit there).
+            page.screenshot(
+                path=out_path,
+                clip={"x": 0, "y": 0, "width": 400, "height": 120},
+            )
+            print(f"FALLBACK: top-left region saved to {out_path}", file=sys.stderr)
+    finally:
+        browser.close()
+PY
+  ) &
+  LOGO_PID=$!
+else
+  warn "  Python playwright not installed; logo will fall back to Firecrawl branding.logo_url if available"
+fi
+
 PERPLEXITY_PID=""
 if command -v ~/.claude/bin/perplexity >/dev/null; then
   research_prompt="What does the company at $URL do, what's their target customer ICP, what industry are they in, and what are the most-cited pain points for businesses in their industry that don't have a marketing team / use HubSpot or similar CRM? Provide stats with citations. Context from the rep: $CONTEXT"
@@ -157,6 +230,15 @@ if [[ -n "$PERPLEXITY_PID" ]]; then
   wait "$PERPLEXITY_PID" || warn "  Perplexity returned non-zero"
   if [[ -s "$PERPLEXITY_OUT" ]]; then
     ok "  Perplexity returned data"
+  fi
+fi
+
+if [[ -n "$LOGO_PID" ]]; then
+  wait "$LOGO_PID" || warn "  Playwright logo capture returned non-zero"
+  if [[ -f "$LOGO_OUT" ]]; then
+    ok "  Logo saved: $LOGO_OUT"
+  else
+    warn "  Logo capture produced no file; will fall back to Firecrawl branding"
   fi
 fi
 
@@ -237,6 +319,13 @@ sources = [url]
 if perplexity.get('citations'):
     sources.extend(perplexity['citations'])
 
+# Logo path (Fix F-research, 2026-04-26). Always-on Playwright capture lands
+# at {work}/logo.png. Phase 2 reads this path and copies it into
+# plan["branding"]["logo_path"] so builder.py can upload to HubSpot Files.
+# If Playwright logo capture didn't produce a file, we leave `logo_path` null
+# and builder.py falls back to skipping the logo strip (no broken image).
+logo_path = f"{work}/logo.png" if os.path.exists(f"{work}/logo.png") else None
+
 research = {
     'url': url,
     'domain': domain,
@@ -252,7 +341,8 @@ research = {
         'secondary_color': secondary,
         'accent_color': accent,
         'all_colors': colors,
-        'logo_url': logo_url,
+        'logo_url': logo_url,                              # remote URL from og:image / favicon
+        'logo_path': logo_path,                            # local Playwright screenshot path
         'screenshot_path': f"{work}/homepage.png" if os.path.exists(f"{work}/homepage.png") else None
     },
     'firecrawl_markdown_excerpt': (firecrawl.get('markdown') or '')[:3000],

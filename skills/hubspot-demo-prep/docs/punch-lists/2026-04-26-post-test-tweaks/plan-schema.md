@@ -23,13 +23,39 @@ This document is the single source of truth for the plan-schema extension that s
     ]
   },
 
+  // Deal records (consumed by builder Phase 4 alongside deal_pipeline).
+  // builder.py reads `d["name"]`, `d["stage"]` (must match a stage label
+  // exactly from deal_pipeline.stages above), and `d.get("amount", 5000)`.
+  // Note v0.3.1 walkthrough caught: do NOT use `dealname`, `stage_label`,
+  // or `closedate_offset_days` — those are HubSpot-internal property names
+  // that builder.py does NOT read. Use the simple keys below.
+  "deals": [
+    {
+      "name": "Acme Corp - Q3 Renewal",
+      "stage": "Stage Name",          // MUST match deal_pipeline.stages[i].label
+      "amount": 12500,                 // USD; defaults to 5000 if omitted
+      "closedate": "2026-06-30"        // optional, ISO 8601
+    }
+  ],
+
   // NEW — branding / theming
   "branding": {
     "primary_color": "#0070F0",       // hex; existed but now load-bearing
     "secondary_color": "#1A1A1A",     // hex; replaces #FF6B35 transport-orange fallback
     "accent_color": "#3B82F6",        // hex; replaces #FF6B35 transport-orange fallback
     "neutral_dark": "#111827",        // for body/title text in doc
-    "neutral_light": "#F9FAFB"        // for backgrounds
+    "neutral_light": "#F9FAFB",       // for backgrounds
+
+    // Fix F (2026-04-26): logo persistence. Phase 1 (helpers/01-research.sh)
+    // always runs a Playwright logo screenshot to {work_dir}/logo.png and
+    // records the path in research.json -> branding.logo_path. Phase 2
+    // copies that path into plan["branding"]["logo_path"]. builder.py's
+    // marketing_email phase reads logo_path, uploads to HubSpot Files, and
+    // populates the HubSpot CDN URL into plan/manifest. doc_generator reads
+    // the HubSpot URL (via manifest) for the doc banner.
+    "logo_path": "/tmp/demo-prep-{slug}/logo.png",   // local Playwright screenshot path
+    "logo_url": "https://...hubspot.com/...",        // HubSpot CDN URL after upload (set by builder)
+    "logo_hubspot_file_id": "..."                    // HubSpot Files ID for cleanup (set by builder)
   },
 
   // NEW — naming / branding for HubSpot-side artifacts
@@ -126,13 +152,21 @@ This document is the single source of truth for the plan-schema extension that s
   // `dropdown` instead. Each dropdown option MUST include a `displayOrder`
   // integer (builder.py auto-injects this if omitted, but plans should set it
   // explicitly to control ordering).
+  //
+  // RECOMMENDED for NPS scales (Fix E1, 2026-04-26): use `field_type: "radio"`
+  // with 10 options (values "1" through "10"). The `number` field type forces
+  // free-text entry, which looks unprofessional in a demo. `radio` renders a
+  // horizontal button-row UX that matches industry NPS form convention.
+  // builder.py auto-populates the 1-10 ladder for any radio field named
+  // `nps_score` (or any radio field with `min:1, max:10`) when `options` is
+  // omitted, so plans don't have to enumerate ten dicts inline.
   "forms": [
     {
       "name": "...",
       "fields": [
-        {"name": "...", "label": "...", "field_type": "single_line_text|email|phone|mobile_phone|dropdown|multi_line_text|number|datepicker|radio|multiple_checkboxes|single_checkbox|file", "required": true,
-         "options": [{"label": "1", "value": "1", "displayOrder": 1}],   // required for dropdown; displayOrder is 1-indexed
-         "min": 1, "max": 10                            // required for number type when 1-10 NPS
+        {"name": "...", "label": "...", "field_type": "single_line_text|email|phone|mobile_phone|dropdown|radio|multi_line_text|number|datepicker|multiple_checkboxes|single_checkbox|file", "required": true,
+         "options": [{"label": "1", "value": "1", "displayOrder": 1}],   // required for dropdown + radio; displayOrder is 1-indexed
+         "min": 1, "max": 10                            // for number OR radio types when modeling 1-10 NPS (radio auto-populates ladder)
         }
       ],
       "submit_text": "...",
@@ -192,6 +226,9 @@ This document is the single source of truth for the plan-schema extension that s
 |-------|----------|
 | `branding.secondary_color` | `"#1A1A1A"` (near-black, brand-neutral) |
 | `branding.accent_color` | `"#3B82F6"` (slate blue) |
+| `branding.logo_path` | Read from `research.branding.logo_path` (Playwright capture). If still absent, builder skips the logo strip (no broken image). |
+| `branding.logo_url` | Set by builder.py after HubSpot Files upload. |
+| `branding.logo_hubspot_file_id` | Set by builder.py for cleanup. |
 | `property_group.name/label` | `f"{slug}_demo_properties"` / `f"Demo ({company_name})"` |
 | `activity_content.lead_label_template` | `"demo inquiry"` |
 | `activity_content.lead_labels` | `["WARM","HOT","COLD"]` |

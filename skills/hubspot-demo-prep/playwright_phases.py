@@ -2,14 +2,17 @@
 """
 playwright_phases.py — UI automation for hubspot-demo-prep
 
-Five HubSpot UI flows that have NO public API surface (see
+HubSpot UI flows that have NO public API surface (see
 references/v2-capabilities.md for the why):
 
-  1. upload_portal_branding(slug, logo_path, primary_color, accent_color)
+  1. upload_portal_branding / upload_portal_branding_with_logo
+       (logo + primary/accent/secondary brand colors site-wide)
   2. create_workflow(slug, workflow_type, contact_id_for_test=None)
   3. create_quote_template(slug, customer_name, logo_path, accent_color)
   4. create_sales_sequence(slug, sender_email)
-  5. kick_off_seo_scan(slug, domain)
+  5. polish_nps_form(slug, customer_name, portal_id, form_guid, ...)
+       (radio-NPS → horizontal scale + theme colors)
+  6. kick_off_seo_scan(slug, domain)
 
 Each flow:
   - Logs into HubSpot via stored auth state (per-portal-per-slug). First run
@@ -438,7 +441,7 @@ def _safe_flow(
 
 
 # ============================================================
-# FLOW 1 — Portal branding upload
+# FLOW 1 — Portal branding upload (logo + brand colors)
 # ============================================================
 
 def upload_portal_branding(
@@ -448,14 +451,44 @@ def upload_portal_branding(
     primary_color: str,
     accent_color: str,
     page: "Page",
+    secondary_color: str | None = None,
 ) -> dict[str, Any]:
     """
-    Settings → Account Defaults → Branding. Upload logo + set primary color.
+    Settings → Account Defaults → Branding. Upload logo + set brand colors.
+
+    When this phase succeeds, the prospect's logo + colors propagate site-wide
+    in HubSpot: form pages, marketing emails sent through HubSpot, customer
+    portal, etc. This is the "make it look like a real customer's portal" win.
+
+    Input contract:
+      - logo_path: absolute path to a local PNG/JPG (HubSpot resizes
+        internally; recommend ~512x512 or larger square logo for best results).
+      - primary_color: hex (e.g. "#1A1A1A"). HubSpot stores as the dominant
+        brand color used on customer-facing assets.
+      - accent_color: hex. Stored as a second brand color slot in HubSpot's
+        "Brand Kit" — used for buttons/CTAs in some templates.
+      - secondary_color: optional hex. If HubSpot's Brand Kit on this portal
+        exposes a third color slot (Marketing Hub Pro+ tiers do), this is
+        applied; otherwise it's logged and skipped without failing the flow.
 
     No public API for brand_settings (see v2-capabilities.md §10). UI-only.
 
     Selectors are role/text-based; the actual labels in HubSpot's React UI as
-    of 2026-04: "Upload logo", "Primary color", "Save".
+    of 2026-04: "Upload logo", "Primary color", "Accent color", "Save".
+
+    Tier dependency: HubSpot's portal branding (logo + primary color) is
+    available on every paid tier. Multiple brand colors / "Brand Kit" with
+    secondary + accent slots typically requires Marketing Hub Starter+. If a
+    color slot is missing on the live tier, the flow skips that slot and
+    records it without erroring.
+
+    Failure modes:
+      - Logo button selector miss → manual_step pointing at Settings → Account
+        Setup → Branding with the local logo path.
+      - Color input missing → skipped silently for that slot, success_result
+        still returned for the slots that worked.
+      - Total flow timeout → _safe_flow wraps and screenshots; manual_step
+        falls back to the deep link.
     """
     flow = "upload_portal_branding"
 
@@ -465,40 +498,125 @@ def upload_portal_branding(
         _wait_idle(p)
         _human_pause(p)
 
+        # v0.3.1 walkthrough caught: HubSpot SANDBOX portals don't expose
+        # Account & Billing → Branding. The page renders "Sandbox accounts
+        # don't have access to Account & Billing." We detect that text early
+        # and emit a clean manual_step instead of timing out on each selector
+        # for 30s × N slots. Production portals continue normally.
+        try:
+            page_text = p.evaluate("() => document.body && document.body.innerText || ''")
+        except Exception:
+            page_text = ""
+        sandbox_blockers = [
+            "Sandbox accounts don't have access",
+            "sandbox accounts don't have access",
+            "not available in sandbox",
+            "Account & Billing isn't available",
+        ]
+        if any(blocker.lower() in (page_text or "").lower() for blocker in sandbox_blockers):
+            _warn("Sandbox portal blocks Account Defaults → Branding (HubSpot product limit). "
+                  "Logo upload + brand colors only land on production portals.")
+            return {
+                "status": "skipped_sandbox",
+                "reason": "Sandbox portals do not expose Account Defaults → Branding. "
+                          "Run on a production portal to apply portal-wide logo + brand colors.",
+                "manual_step": {
+                    "item": "Portal branding (logo + colors)",
+                    "ui_url": url,
+                    "instructions": (
+                        f"This is a production-portal-only setting. "
+                        f"On a production HubSpot, upload {logo_path} and set "
+                        f"primary={primary_color}"
+                        + (f", accent={accent_color}" if accent_color else "")
+                        + (f", secondary={secondary_color}" if secondary_color else "")
+                        + ". Sandbox portals inherit the parent account's branding."
+                    ),
+                },
+            }
+
+        applied: dict[str, Any] = {
+            "logo_uploaded": False,
+            "primary_color": None,
+            "accent_color": None,
+            "secondary_color": None,
+        }
+
         # Logo upload — file chooser pattern, since the input is hidden behind
         # a styled "Upload logo" button.
         if logo_path and os.path.exists(logo_path):
-            with p.expect_file_chooser() as fc_info:
-                # GUESSED selector: match either "Upload logo" or "Upload" CTA.
-                p.get_by_role("button", name=re.compile(r"upload\s*(logo)?", re.I)).first.click()
-            file_chooser = fc_info.value
-            file_chooser.set_files(logo_path)
-            _ok(f"logo uploaded: {logo_path}")
-            _human_pause(p)
+            try:
+                with p.expect_file_chooser() as fc_info:
+                    # GUESSED selector: match either "Upload logo" or "Upload" CTA.
+                    p.get_by_role(
+                        "button",
+                        name=re.compile(r"upload\s*(logo)?|replace\s+logo|change\s+logo", re.I),
+                    ).first.click()
+                file_chooser = fc_info.value
+                file_chooser.set_files(logo_path)
+                _ok(f"logo uploaded: {logo_path}")
+                applied["logo_uploaded"] = True
+                _human_pause(p)
+            except Exception as e:
+                _warn(f"logo upload failed ({e}) — continuing with colors")
+        else:
+            _warn(f"logo_path missing or not found ({logo_path}) — skipping logo upload")
 
-        # Primary color input.
+        # Primary color (the customer-facing dominant brand color).
         try:
-            p.get_by_label(re.compile(r"primary\s*color", re.I)).first.fill(accent_color)
-            _ok(f"primary color set: {accent_color}")
+            p.get_by_label(re.compile(r"primary\s*color", re.I)).first.fill(primary_color)
+            applied["primary_color"] = primary_color
+            _ok(f"primary color set: {primary_color}")
         except Exception:
-            p.get_by_text(re.compile(r"primary\s*color", re.I)).first.click()
-            _human_pause(p)
-            p.keyboard.type(accent_color)
+            try:
+                p.get_by_text(re.compile(r"primary\s*color", re.I)).first.click()
+                _human_pause(p)
+                p.keyboard.type(primary_color)
+                applied["primary_color"] = primary_color
+            except Exception as e:
+                _warn(f"primary color input not found ({e})")
+
+        # Accent color slot. HubSpot's Brand Kit exposes this on Starter+
+        # tiers as "Accent color" or "Brand color 2".
+        try:
+            p.get_by_label(
+                re.compile(r"accent\s*color|brand\s*color\s*2|secondary\s*brand\s*color", re.I)
+            ).first.fill(accent_color)
+            applied["accent_color"] = accent_color
+            _ok(f"accent color set: {accent_color}")
+        except Exception:
+            _warn("accent color slot not found — likely tier-restricted; skipping")
+
+        # Secondary color slot — typically only on Marketing Hub Pro+.
+        if secondary_color:
+            try:
+                p.get_by_label(
+                    re.compile(r"^secondary\s*color$|brand\s*color\s*3|tertiary\s*color", re.I)
+                ).first.fill(secondary_color)
+                applied["secondary_color"] = secondary_color
+                _ok(f"secondary color set: {secondary_color}")
+            except Exception:
+                _warn("secondary color slot not found — likely tier-restricted; skipping")
 
         _human_pause(p)
         # Save
-        p.get_by_role("button", name=re.compile(r"^save$", re.I)).first.click()
-        _wait_idle(p)
-        _human_pause(p, 1000, 2000)
+        try:
+            p.get_by_role("button", name=re.compile(r"^save$", re.I)).first.click()
+            _wait_idle(p)
+            _human_pause(p, 1000, 2000)
+        except Exception as e:
+            _warn(f"save button click failed ({e})")
 
-        # Verify by reloading and confirming the color value persists.
-        p.reload(wait_until="domcontentloaded")
-        _wait_idle(p)
+        # Verify by reloading and confirming the primary color value persists.
+        try:
+            p.reload(wait_until="domcontentloaded")
+            _wait_idle(p)
+        except Exception:
+            pass
         verified = False
         try:
             color_input = p.get_by_label(re.compile(r"primary\s*color", re.I)).first
             v = color_input.input_value()
-            verified = (v.lower().lstrip("#") == accent_color.lower().lstrip("#"))
+            verified = (v.lower().lstrip("#") == primary_color.lower().lstrip("#"))
         except Exception:
             verified = False
 
@@ -506,13 +624,79 @@ def upload_portal_branding(
             flow,
             extras={
                 "logo_path": logo_path,
-                "primary_color": accent_color,
+                "primary_color": applied["primary_color"],
+                "accent_color": applied["accent_color"],
+                "secondary_color": applied["secondary_color"],
+                "logo_uploaded": applied["logo_uploaded"],
                 "verified": verified,
                 "url": url,
             },
         )
 
     return _safe_flow(slug, flow, _do, page)
+
+
+def upload_portal_branding_with_logo(
+    slug: str,
+    customer_name: str,
+    portal_id: str,
+    logo_path: str,
+    primary_color: str,
+    secondary_color: str | None = None,
+    accent_color: str | None = None,
+    page: "Page" | None = None,
+    work_dir: str | None = None,
+    env_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Wire-friendly wrapper around `upload_portal_branding` matching the v0.3.1
+    phase signature spec'd by Jeremy:
+
+        (slug, customer_name, portal_id, logo_path, primary_color,
+         secondary_color=None, accent_color=None, work_dir=None, env_path=None)
+
+    This is the public phase name listed in the orchestrator. Internally it
+    just calls `upload_portal_branding` with the args remapped — the heavy
+    lifting (selectors, file chooser, fallbacks) lives there.
+
+    `customer_name` is accepted for logging/manual-step messaging; it isn't
+    sent to HubSpot here (the company name lives on the company record, not
+    portal branding).
+
+    `env_path` is accepted for signature parity with other v0.3.1 phases;
+    this flow doesn't write to env.
+
+    If `accent_color` is None, falls back to `primary_color` so the existing
+    `upload_portal_branding` always has a valid second slot to attempt.
+
+    `page` is required when called from inside an active PlaywrightSession.
+    The function is structured this way (page-as-arg) so the orchestrator
+    `run_all_phases` can share one browser session across all flows.
+    """
+    if page is None:
+        return _manual_step_result(
+            flow="upload_portal_branding_with_logo",
+            item=f"Upload portal branding for {customer_name}",
+            ui_url=f"{HUBSPOT_BASE}/account/{portal_id}/account-defaults?tab=branding",
+            instructions=(
+                "Open Settings → Account Setup → Branding and upload "
+                f"{logo_path}. Set primary color to {primary_color}"
+                + (f", accent color to {accent_color}" if accent_color else "")
+                + (f", secondary color to {secondary_color}" if secondary_color else "")
+                + "."
+            ),
+            reason="No active Playwright page passed; cannot drive UI.",
+        )
+    effective_accent = accent_color or primary_color
+    return upload_portal_branding(
+        slug=slug,
+        portal_id=portal_id,
+        logo_path=logo_path,
+        primary_color=primary_color,
+        accent_color=effective_accent,
+        page=page,
+        secondary_color=secondary_color,
+    )
 
 
 # ============================================================
@@ -1060,6 +1244,250 @@ def kick_off_seo_scan(
 
 
 # ============================================================
+# FLOW 6 — Polish NPS form (radio → horizontal scale + theme colors)
+# ============================================================
+
+def polish_nps_form(
+    slug: str,
+    customer_name: str,
+    portal_id: str,
+    form_guid: str,
+    primary_color: str,
+    secondary_color: str | None = None,
+    page: "Page" | None = None,
+    work_dir: str | None = None,
+    env_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Open the form editor for the API-built NPS form (radio with 10 options
+    1-10) and apply the polish that the API can't:
+
+      1. Try to switch the NPS score field's radio layout to "Horizontal" /
+         "Inline" so the 10 options render as a connected scale instead of a
+         vertical list. (Available on Marketing Hub Pro+; on lower tiers this
+         option may not be exposed in the field-style panel.)
+      2. Apply theme colors deeper than just the submit button: form
+         background tint (subtle), label color, input border color, helper
+         text color — using primary + secondary brand colors.
+      3. Save.
+
+    On any failure: screenshot, manual_step pointing at the form editor URL,
+    keep the build green. This is bonus polish — the form remains functional
+    if the polish fails.
+
+    Args:
+      form_guid: the form GUID returned from the API form-builder. Pulled
+        from `manifest["forms"]["<NPS form name>"]` by the orchestrator.
+
+    Failure modes & manual fallbacks:
+      - Form editor URL 404 / form not found → manual_step asking the rep to
+        open Marketing → Forms → find the NPS form by name and edit manually.
+      - Field-style panel not exposing "Horizontal" → log a manual_step:
+        "Open form in HubSpot UI → click NPS score field → Style tab → set
+        Display style to Horizontal." Falls through gracefully; theme colors
+        are still attempted.
+      - Style panel selectors miss → record manual_step with deep link.
+
+    Tier dependency: form Style customization (label color, border color,
+    background) is available on Marketing Hub Starter+. The "Horizontal" /
+    inline radio layout typically requires Marketing Hub Pro+; on Starter
+    the field-style panel only exposes vertical/stacked. The flow is
+    written to skip slots that aren't exposed rather than fail.
+    """
+    flow = "polish_nps_form"
+
+    if page is None:
+        return _manual_step_result(
+            flow=flow,
+            item=f"Polish NPS form for {customer_name}",
+            ui_url=f"{HUBSPOT_BASE}/forms/{portal_id}/editor/{form_guid}/edit/form",
+            instructions=(
+                "Open the NPS form in HubSpot's form editor. Click the NPS "
+                "score field, switch its display style to Horizontal/Inline, "
+                f"then set theme colors: labels {primary_color}"
+                + (f", secondary {secondary_color}" if secondary_color else "")
+                + "."
+            ),
+            reason="No active Playwright page passed; cannot drive UI.",
+        )
+
+    if not form_guid:
+        return _manual_step_result(
+            flow=flow,
+            item=f"Polish NPS form for {customer_name}",
+            ui_url=f"{HUBSPOT_BASE}/forms/{portal_id}",
+            instructions=(
+                "No NPS form GUID was found in the manifest. Open Marketing → "
+                "Forms, locate the NPS form, and apply Horizontal display "
+                f"style + theme colors ({primary_color})."
+            ),
+            reason="manifest['forms'] did not contain an NPS-named form GUID.",
+        )
+
+    def _do(p: "Page") -> dict[str, Any]:
+        url = f"{HUBSPOT_BASE}/forms/{portal_id}/editor/{form_guid}/edit/form"
+        p.goto(url, wait_until="domcontentloaded")
+        _wait_idle(p)
+        _human_pause(p)
+
+        applied: dict[str, Any] = {
+            "horizontal_layout": False,
+            "label_color": None,
+            "input_border_color": None,
+            "helper_color": None,
+            "form_background": None,
+            "submit_color": None,
+        }
+
+        # ---- Step 1: Find and click the NPS score field ----
+        # The NPS score field will be the radio field with 10 options. We
+        # locate it by clicking any field whose label contains "score" /
+        # "NPS" / "1-10". If multiple match, take the first.
+        try:
+            nps_field = p.get_by_text(
+                re.compile(r"score|nps|how\s+likely|1\s*[-–]\s*10|recommend", re.I)
+            ).first
+            nps_field.click()
+            _human_pause(p)
+            _ok("NPS score field selected in editor")
+        except Exception as e:
+            _warn(f"could not select NPS score field ({e})")
+
+        # ---- Step 2: Try to switch layout to Horizontal ----
+        # HubSpot's field options panel opens on the right after clicking a
+        # field. Look for a "Display style" / "Layout" / "Field style" toggle.
+        try:
+            # First, try clicking a "Style" or "Display" tab inside the panel.
+            for tab_label in ("Style", "Display", "Field style", "Layout"):
+                try:
+                    p.get_by_role("tab", name=re.compile(rf"^{re.escape(tab_label)}$", re.I)).first.click(timeout=2_000)
+                    _human_pause(p, 200, 500)
+                    break
+                except Exception:
+                    continue
+
+            # Then click the Horizontal option.
+            try:
+                p.get_by_role(
+                    "radio", name=re.compile(r"horizontal|inline", re.I)
+                ).first.click(timeout=3_000)
+                applied["horizontal_layout"] = True
+                _ok("NPS field layout: horizontal")
+            except Exception:
+                # Fallback: button or text-only toggle
+                try:
+                    p.get_by_role(
+                        "button", name=re.compile(r"horizontal|inline", re.I)
+                    ).first.click(timeout=2_000)
+                    applied["horizontal_layout"] = True
+                    _ok("NPS field layout: horizontal (button)")
+                except Exception:
+                    _warn(
+                        "Horizontal layout option not exposed on this tier — "
+                        "recording manual_step. Will continue with theme colors."
+                    )
+            _human_pause(p)
+        except Exception as e:
+            _warn(f"layout switch path errored ({e})")
+
+        # ---- Step 3: Theme colors ----
+        # Navigate to the form-wide Style tab (separate from per-field style).
+        # HubSpot's form editor usually has a top-level "Style" or "Style &
+        # preview" tab in addition to per-field style.
+        try:
+            for tab_label in ("Style & preview", "Style", "Theme"):
+                try:
+                    p.get_by_role("tab", name=re.compile(rf"^{re.escape(tab_label)}$", re.I)).first.click(timeout=2_000)
+                    _human_pause(p, 300, 700)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            _warn("style tab not found — colors may not apply")
+
+        def _try_fill_color(label_pattern: str, value: str, slot: str) -> None:
+            """Attempt to fill a color input by label; skip silently on miss."""
+            try:
+                p.get_by_label(re.compile(label_pattern, re.I)).first.fill(value)
+                applied[slot] = value
+                _ok(f"{slot} set: {value}")
+            except Exception:
+                _warn(f"{slot} input not found (pattern={label_pattern}) — skipped")
+
+        # Submit-button color → primary (most impactful CTA color).
+        _try_fill_color(r"submit.*color|button.*color", primary_color, "submit_color")
+        # Label color → primary (text headlines).
+        _try_fill_color(r"label\s*color|field\s*label", primary_color, "label_color")
+        # Helper text → secondary (or primary if no secondary).
+        _try_fill_color(
+            r"help(er)?\s*text\s*color|description\s*color",
+            secondary_color or primary_color,
+            "helper_color",
+        )
+        # Input border → primary (subtle brand presence on focus).
+        _try_fill_color(
+            r"border\s*color|input\s*border",
+            primary_color,
+            "input_border_color",
+        )
+        # Form background — leave default unless secondary_color provided
+        # (background changes are visually risky; only apply when caller
+        # explicitly sent a secondary color implying a designer-curated
+        # palette).
+        if secondary_color:
+            _try_fill_color(r"background\s*color|form\s*background", secondary_color, "form_background")
+
+        _human_pause(p)
+
+        # ---- Step 4: Save ----
+        try:
+            p.get_by_role(
+                "button", name=re.compile(r"^update|^save|publish", re.I)
+            ).first.click()
+            _wait_idle(p)
+            _human_pause(p, 1000, 2000)
+            _ok("form saved")
+        except Exception as e:
+            _warn(f"save click failed ({e})")
+
+        # Build the result. If horizontal layout failed AND no colors stuck,
+        # this is effectively a no-op — flag as partial with a manual_step.
+        any_applied = applied["horizontal_layout"] or any(
+            applied[k] for k in ("label_color", "input_border_color", "helper_color", "submit_color", "form_background")
+        )
+        result = _success_result(
+            flow,
+            extras={
+                "form_guid": form_guid,
+                "applied": applied,
+                "url": url,
+            },
+        )
+        if not applied["horizontal_layout"]:
+            # The headline polish (radio → scale) didn't land. Surface a
+            # manual_step so the rep can flip it in 5 seconds before the demo.
+            result["status"] = "partial" if any_applied else "manual_step"
+            result["manual_step"] = {
+                "item": f"Set NPS field to Horizontal layout",
+                "ui_url": url,
+                "instructions": (
+                    "Open the NPS form in HubSpot's form editor → click the "
+                    "NPS score field → Style tab → set Display style to "
+                    "Horizontal. (Marketing Hub Pro+ feature; if it's not "
+                    "available on this tier, leave the radio buttons stacked — "
+                    "the form is still functional.)"
+                ),
+                "reason": (
+                    "Horizontal layout selector did not resolve in the form "
+                    "editor — likely tier-restricted or HubSpot UI changed."
+                ),
+            }
+        return result
+
+    return _safe_flow(slug, flow, _do, page)
+
+
+# ============================================================
 # Phase orchestrator (called by Builder.run_playwright_phases)
 # ============================================================
 
@@ -1073,6 +1501,7 @@ def run_all_phases(
     customer_name: str,
     sender_email: str,
     domain: str,
+    secondary_color: str | None = None,
     marketing_email_id: str | None = None,
     nps_form_guid: str | None = None,
     primary_keyword: str | None = None,
@@ -1080,9 +1509,19 @@ def run_all_phases(
     work_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Run all 5 flows sequentially. Each returns a status dict. The list is
+    Run all UI flows sequentially. Each returns a status dict. The list is
     meant to be merged by the caller (Builder.run_playwright_phases) into
-    manifest under e.g. manifest["playwright_phases"].
+    manifest under manifest["playwright_phases"].
+
+    Order:
+      1. upload_portal_branding_with_logo  (logo + brand colors site-wide)
+      2. create_workflow lead_nurture
+      3. create_workflow nps_routing
+      4. create_quote_template
+      5. create_sales_sequence
+      6. polish_nps_form  (radio → horizontal scale; theme colors)
+      7. kick_off_seo_scan  (async kickoff, last because it doesn't gate
+         anything else)
     """
     if not PLAYWRIGHT_AVAILABLE:
         msg = (
@@ -1092,9 +1531,17 @@ def run_all_phases(
         _warn(msg)
         return [{"flow": "all", "status": "skipped", "reason": msg}]
 
-    if not _has_state(slug) and not first_run:
+    # Bug fix (2026-04-27): _has_state / _state_path are keyed by *portal_id*
+    # (state files are named `portal-{portal_id}-hubspot.json` — see
+    # _state_path at line ~128). The previous code passed `slug` here, which
+    # made every run with --playwright bail out with a "no storage state"
+    # manual step even though the portal-keyed state file existed and the
+    # PlaywrightSession constructor would happily load it. The visible
+    # symptom: portal branding upload (Fix F3) never ran on any v0.3.1
+    # build.
+    if not _has_state(portal_id) and not first_run:
         msg = (
-            f"No storage state at {_state_path(slug)}. "
+            f"No storage state at {_state_path(portal_id)}. "
             "Re-run with --first-run to perform interactive login first."
         )
         _warn(msg)
@@ -1115,11 +1562,21 @@ def run_all_phases(
         page = session.page
         assert page is not None
 
-        results.append(upload_portal_branding(
-            slug=slug, portal_id=portal_id,
-            logo_path=logo_path, primary_color=primary_color,
-            accent_color=accent_color, page=page,
+        # 1. Portal branding (logo + colors). v0.3.1: use the wrapper
+        # `upload_portal_branding_with_logo` which adds secondary_color
+        # support and a customer_name-aware manual_step fallback.
+        results.append(upload_portal_branding_with_logo(
+            slug=slug,
+            customer_name=customer_name,
+            portal_id=portal_id,
+            logo_path=logo_path,
+            primary_color=primary_color,
+            secondary_color=secondary_color,
+            accent_color=accent_color,
+            page=page,
+            work_dir=work_dir,
         ))
+        # 2-3. Workflows
         results.append(create_workflow(
             slug=slug, portal_id=portal_id,
             workflow_type="lead_nurture", page=page,
@@ -1134,6 +1591,7 @@ def run_all_phases(
             customer_name=customer_name,
             work_dir=work_dir,
         ))
+        # 4. Quote template
         results.append(create_quote_template(
             slug=slug, portal_id=portal_id,
             customer_name=customer_name,
@@ -1142,6 +1600,7 @@ def run_all_phases(
             page=page,
             work_dir=work_dir,
         ))
+        # 5. Sales sequence
         results.append(create_sales_sequence(
             slug=slug, portal_id=portal_id,
             sender_email=sender_email,
@@ -1149,6 +1608,28 @@ def run_all_phases(
             customer_name=customer_name,
             work_dir=work_dir,
         ))
+        # 6. v0.3.1 polish: convert API-built radio NPS form to horizontal
+        # scale + apply theme colors. Skipped gracefully if no NPS form
+        # GUID is in the manifest.
+        if nps_form_guid:
+            results.append(polish_nps_form(
+                slug=slug,
+                customer_name=customer_name,
+                portal_id=portal_id,
+                form_guid=nps_form_guid,
+                primary_color=primary_color,
+                secondary_color=secondary_color,
+                page=page,
+                work_dir=work_dir,
+            ))
+        else:
+            _warn("polish_nps_form: no nps_form_guid; skipping")
+            results.append({
+                "flow": "polish_nps_form",
+                "status": "skipped",
+                "reason": "No NPS form GUID in manifest['forms'].",
+            })
+        # 7. SEO scan kickoff (async; last because it doesn't gate anything).
         results.append(kick_off_seo_scan(
             slug=slug, portal_id=portal_id,
             domain=domain, page=page,
@@ -1220,6 +1701,11 @@ def _main(argv: list[str]) -> int:
         or manifest_brand.get("accent_color")
         or "#3B82F6"
     )
+    secondary_color_default = (
+        plan_brand.get("secondary_color")
+        or manifest_brand.get("secondary_color")
+        or None
+    )
     logo_default = f"/tmp/demo-prep-{slug}/{slug}-og.png"
     results = run_all_phases(
         slug=slug,
@@ -1227,6 +1713,7 @@ def _main(argv: list[str]) -> int:
         logo_path=logo_default,
         primary_color=primary_color_default,
         accent_color=accent_color_default,
+        secondary_color=secondary_color_default,
         customer_name=company_name,
         sender_email=sender_email,
         domain=domain,

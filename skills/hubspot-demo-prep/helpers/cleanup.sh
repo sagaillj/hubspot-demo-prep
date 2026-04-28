@@ -39,8 +39,12 @@ JSON
 )
   local resp
   resp=$(hs_curl POST "/crm/v3/objects/$object_path/search" "$search_body")
-  if [[ "$HS_LAST_STATUS" != "200" ]]; then
-    warn "Search failed for $object_label (HTTP $HS_LAST_STATUS); skipping. Note: demo_customer property may not exist for this object type yet."
+  # v0.3.1 fix: HS_LAST_STATUS doesn't propagate from $(...) subshell to parent.
+  # lib.sh writes the status to /tmp/hs_last_status; read it back here.
+  local last_status
+  last_status=$(cat /tmp/hs_last_status 2>/dev/null || echo "")
+  if [[ "$last_status" != "200" ]]; then
+    warn "Search failed for $object_label (HTTP $last_status); skipping. Note: demo_customer property may not exist for this object type yet."
     return
   fi
 
@@ -63,10 +67,13 @@ for r in json.load(sys.stdin).get('results', []):
 " | while read -r id; do
     [[ -z "$id" ]] && continue
     hs_curl DELETE "/crm/v3/objects/$object_path/$id" >/dev/null
-    if [[ "$HS_LAST_STATUS" =~ ^2 ]]; then
+    # Same subshell-propagation issue as above.
+    local del_status
+    del_status=$(cat /tmp/hs_last_status 2>/dev/null || echo "")
+    if [[ "$del_status" =~ ^2 ]]; then
       ok "    deleted $object_label $id"
     else
-      warn "    failed to delete $object_label $id (HTTP $HS_LAST_STATUS)"
+      warn "    failed to delete $object_label $id (HTTP $del_status)"
     fi
   done
 }

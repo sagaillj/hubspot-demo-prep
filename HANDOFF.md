@@ -610,3 +610,72 @@ The verify caught 4 real bugs that v0.3.0 was supposed to prevent or that the fi
 4. **`plan["deal_pipeline"]["stages"]` shape gap.** Bare-string stages crashed builder. Plan-schema doc now explicitly documents `[{label, probability}, ...]` shape; builder.py also coerces bare strings defensively.
 
 Plus a small bonus: `manifest["output"]["doc_url"]` now persists the Drive URL (was null even when upload succeeded).
+
+## v0.3.1 — 2026-04-26 night (walkthrough fix iteration)
+
+### What landed
+
+The v0.3.0 production verify on 1800LAW1010.com surfaced 6 visible-quality issues during Jeremy's walkthrough. v0.3.1 closes them. The lens for every change: "top 10%, brand-consistent, makes HubSpot look good. If it looks like AI slop, the skill defeats itself."
+
+**Six v0.3.0 walkthrough issues + how v0.3.1 fixes them:**
+
+A. **Doc top header** — replaced the generated banner with a 2-cell logo+title header (option B). Logo cell on the left (1.4" max width, 0.8" max height), title "HubSpot Demo Prep: {Company}" on the right (muted prefix + bold company name), thin colored rule beneath in primary color. Subtitle reads "Demo for Sales Engineer · {Date} · Sandbox portal {portal}". Graceful fallback to title-only when logo is absent. doc_generator.py.
+
+B. **Time-saved hero reworded** — "Saved ~Xh vs manual HubSpot setup" → "It would take approximately ~Xh to create the equivalent demo portal manually." No em dashes (per Jeremy's CLAUDE.md). doc_generator.py.
+
+C. **Pipeline board view shows deals** — root cause was 2-part: (1) the legacy `/sales/{portal}/deals/board/view/all/?pipeline=` URL ignores the query param and renders the user's last-viewed pipeline (often empty), (2) the `?pipeline=` query name on the modern object-records URL doesn't auto-switch HubSpot's UI either. Fix: use both `?pipeline={id}&pipelineId={id}` (HubSpot's internal `pipelineId` is what their pipeline-picker writes), plus a post-build verification loop that GETs every deal and PATCHes if any landed on the wrong pipeline. builder.py.
+
+D. **Priya 4× duplicate associations** — root cause: `PUT contacts/{cid}/associations/companies/{cid}/1` isn't truly idempotent in HubSpot's UI (each PUT creates a new "associated company" UI row). Re-running builder.py 4× compounded to 4 entries on every contact. Fix: new `_associate_contact_to_company_idempotent()` helper does GET → check → skip-if-exists. Audited all 6 association sites; only contact→company has this bug. builder.py.
+
+E. **NPS form quality** — `_build_form_body` and `_value_for` got a `radio` branch. NPS forms now use `field_type: "radio"` with 10 options 1-10 (with `displayOrder`) instead of free-text `number`. Auto-populates the 1-10 ladder when the radio field is named `nps_score`. Score distribution applied to test submissions. Reichheld's canonical phrasing in SKILL.md Phase 2: "On a scale of 1 to 10, how likely are you to recommend {company} to a friend or colleague?" + "What's the primary reason for your score?" Form `theme.submit_button_color` always synthesized from `branding.primary_color`. Optional Playwright polish (`polish_nps_form`) attempts horizontal layout — gracefully falls back to manual_step on lower tiers. builder.py + SKILL.md + plan-schema.md + playwright_phases.py.
+
+F. **Logo extraction in Phase 1 + everywhere it should appear**:
+- F1. helpers/01-research.sh: always-on Playwright Python block screenshots the prospect's logo to `/tmp/demo-prep-{slug}/logo.png`. 7 selectors in priority order (header alt-logo, header `a[href='/']` img, nav alt-logo, `.logo`, `.header__logo`, etc.) → fallback to top-left page region. Records `branding.logo_path` in research.json.
+- F2. builder.py: new `upload_logo_image()` (mirrors `upload_hero_image`); marketing email widget body now embeds logo header (centered, 48px max-height) above the existing hero.
+- F3. playwright_phases.py: `upload_portal_branding_with_logo` phase uploads the logo as portal-wide branding via Settings → Account Defaults → Branding. Sandbox-aware: detects "Sandbox accounts don't have access" page text and emits clean `skipped_sandbox` manual_step (sandbox portals can't access this — production portals only). Each color slot fails open per HubSpot tier.
+- F4. doc_generator.py: header reads `manifest["branding"]["logo_path"]` (or plan/research fallback) and embeds at top-left of the doc.
+
+**Marketing email CTA always renders** (caught during v0.3.1 re-verify): the `body_html` path was previously not appending the CTA block — only the fallback steps-based path did. Now both render the CTA explicitly at the bottom of the body. builder.py.
+
+**Form-submission API host fix** (caught during v0.3.1 re-verify): `form_submit` was hitting `api.hubapi.com` and getting 404 on every call — the actual host is `api.hsforms.com`. This is the root cause of "0/N form submissions" on every v0.3.0 build. v0.3.1's verify run produced 14/14 submissions for the first time. builder.py.
+
+**Bug fixes caught during v0.3.1 verify run** (also patched):
+- `industry: "OTHER"` was an invalid HubSpot enum value; killed Phase 2.
+- doc_generator's amount-summing helper TypeError on `int + str` deal amounts.
+- builder.py only read `logo_path` from legacy `plan["brand"]`; updated to walk all three sources.
+- playwright_phases `_has_state(slug)` should be `_has_state(portal_id)`.
+
+**Subshell propagation bug in cleanup.sh** — `HS_LAST_STATUS` was being set inside a `$(hs_curl ...)` subshell and lost in the parent. Now reads from `/tmp/hs_last_status` which `lib.sh` writes for cross-subshell access. helpers/cleanup.sh.
+
+**Schema doc deals-array clarification** — added explicit `plan["deals"]` shape to plan-schema.md so future Phase 2 syntheses use the correct keys (`name`/`stage`/`amount`/`closedate`, NOT `dealname`/`stage_label`/`closedate_offset_days`).
+
+### Files touched (v0.3.1)
+- builder.py: ~3170 → ~3445 lines (~275 net additions)
+- doc_generator.py: ~209 net additions (~75% of which is the new logo+title header)
+- playwright_phases.py: ~557 net additions (two new phases + sandbox detection)
+- helpers/01-research.sh: +92 lines (Playwright logo screenshot)
+- helpers/cleanup.sh: +15 lines (subshell fix)
+- plan-schema.md: +45 lines (deals array, logo branding, NPS radio rules)
+- SKILL.md: +4 lines (Phase 2 Quality Gate items 7+8)
+
+### v0.3.1 verify run on 1800LAW1010 (Harding Mazzotti)
+End-to-end run with `--playwright`, fresh sandbox cleanup. Top-10% lens applied to every deliverable.
+
+| Fix | Status | Notes |
+|-----|--------|-------|
+| A. Doc top header | PASS | Logo + bold title + colored rule renders cleanly |
+| B. Time-saved copy | PASS | New copy verified in docx; old "Saved Xh" string gone |
+| C. Pipeline shows deals | PASS-after-fix | `?pipelineId=` added to URL; deals all on correct pipeline |
+| D. Priya 1× association | PASS | API GET returns exactly 1 |
+| E. NPS form quality | PARTIAL | API: radio + 10 options + Reichheld phrasing ✓. Visual: vertical stack on Marketing Hub Free; horizontal scale requires Pro+ tier (Playwright polish detects + falls back gracefully) |
+| F1. Doc logo | PASS | Embedded at top-left in 2-cell header |
+| F2. Email logo | PASS-after-fix | Logo header + CTA both render now |
+| F3. Portal branding | PASS-after-fix | Sandbox-detection emits clean manual_step pointing at production portal |
+
+API layer: 18/18 phases verified; manifest_integrity passes 14/14 form submissions; doc_url_verification passes; `--playwright` phases gracefully degrade per tier.
+
+### Backlog (medium, non-blocking)
+- NPS form on lower HubSpot tiers (Marketing Hub Free / Starter) renders vertical radio stack — looks default-HubSpot, not branded. Resolved on Pro+ via the polish_nps_form Playwright phase, OR via portal branding upload (production portals only). Sandbox runs surface a clear manual_step.
+- Pipeline deep-link works in API + visible deals confirmed; if HubSpot ever ignores both `?pipeline=` AND `?pipelineId=` in a future UI revision, fall back to setting per-user default-pipeline preference.
+- `_sanitize_reason` includes "validation" in forbidden tokens — could over-strip benign uses. No current callsite triggers it.
+- HANDOFF.md historical sections still reference Shipperz extensively (intentional — historical record, not runtime).

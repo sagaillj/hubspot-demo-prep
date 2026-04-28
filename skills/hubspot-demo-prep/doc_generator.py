@@ -413,19 +413,26 @@ def _contact_url(portal: str, cid: str) -> str:
 
 
 # =====================================================================
-# Banner discovery
+# Logo discovery
 # =====================================================================
 
-def _banner_path(work_dir: str, slug: str) -> str | None:
-    """Return the first banner image that exists, or None."""
-    candidates = [
-        os.path.join(work_dir, f"{slug}-banner.png"),
-        os.path.join(work_dir, "hero-image-email.png"),
-        os.path.join(work_dir, "hero-image.png"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
+def _logo_path(manifest: dict, plan: dict) -> str | None:
+    """Return the prospect's logo path if it exists and is readable.
+
+    Looks at manifest['branding']['logo_path'] first, then plan['branding']
+    ['logo_path']. Returns None if neither is set or the file is missing —
+    older runs predating logo extraction degrade gracefully (header renders
+    title-only, no logo cell).
+    """
+    for src in (manifest, plan):
+        if not isinstance(src, dict):
+            continue
+        branding = src.get("branding") or {}
+        if not isinstance(branding, dict):
+            continue
+        path = branding.get("logo_path")
+        if isinstance(path, str) and path and os.path.isfile(path):
+            return path
     return None
 
 
@@ -438,6 +445,18 @@ def _format_currency(amount) -> str:
         return f"${int(round(float(amount))):,}"
     except (TypeError, ValueError):
         return str(amount or "")
+
+
+def _coerce_amount(amount) -> int:
+    """Bug fix (2026-04-27): plan deal amounts arrive as either int OR string
+    (the legacy schema doc told orchestrators to send strings; builder.py
+    coerces them server-side before posting to HubSpot but the doc generator
+    summed them raw, hitting `TypeError: int + str` on the very first run with
+    a string-typed amount. This helper centralizes the coercion."""
+    try:
+        return int(round(float(amount or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_runtime(seconds) -> str | None:
@@ -468,14 +487,17 @@ def _render_time_saved_hero(doc, manifest: dict, plan: dict) -> None:
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(4)
     p.paragraph_format.space_after = Pt(0)
-    r = p.add_run(f"⏱  Saved {pretty} vs manual HubSpot setup")
+    r = p.add_run(
+        f"⏱  It would take approximately {pretty} to create the equivalent "
+        f"demo portal manually."
+    )
     _set_run(r, color=accent, bold=True, size=13)
     runtime_pretty = _format_runtime(manifest.get("runtime_seconds"))
     if runtime_pretty:
         sub = doc.add_paragraph()
         sub.paragraph_format.space_before = Pt(0)
         sub.paragraph_format.space_after = Pt(4)
-        sr = sub.add_run(f"Built in {runtime_pretty}")
+        sr = sub.add_run(f"This demo was built in {runtime_pretty}.")
         _set_run(sr, color=GRAY, italic=True, size=9)
 
 
@@ -526,6 +548,126 @@ def _render_time_saved_breakdown(doc, manifest: dict, plan: dict) -> None:
         _set_run(run, color=accent, bold=True, size=9)
 
 
+def _rep_name(manifest: dict, plan: dict, research: dict) -> str:
+    """Return a rep name for the subtitle, else 'Sales Engineer'.
+
+    Looks at manifest['rep_name'], plan['rep_name'], research['rep_name'],
+    and falls back to 'Sales Engineer' if none are set. Strings only.
+    """
+    for src in (manifest, plan, research):
+        if not isinstance(src, dict):
+            continue
+        v = src.get("rep_name")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return "Sales Engineer"
+
+
+def _render_header(doc, manifest: dict, plan: dict, research: dict, *,
+                   company_name: str, portal: str) -> None:
+    """Render the consulting-deliverable top header.
+
+    Layout: 1-row x 2-col table at the top of the doc — logo left (~1.5"),
+    title right (~5"). Below the table: subtitle line in gray, then a thin
+    colored rule in the prospect's primary color (or accent fallback) that
+    separates the header from page content.
+
+    If no logo is available (manifest/plan branding missing logo_path or
+    file unreadable), the title spans the full width — no logo cell — so
+    the layout still feels intentional and centered, not awkwardly empty.
+    """
+    dark = _dark_text(manifest, plan)
+    # Use primary_color for the rule when available; else accent.
+    rule_color = _branding_color(manifest, plan, "primary_color", _accent_color(manifest, plan))
+    logo = _logo_path(manifest, plan)
+
+    if logo:
+        table = doc.add_table(rows=1, cols=2)
+        table.autofit = False
+        table.allow_autofit = False
+        # Column widths: logo cell ~1.5", title cell ~5".
+        try:
+            table.columns[0].width = Inches(1.5)
+            table.columns[1].width = Inches(5.0)
+            for row in table.rows:
+                row.cells[0].width = Inches(1.5)
+                row.cells[1].width = Inches(5.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Logo cell.
+        logo_cell = table.rows[0].cells[0]
+        logo_para = logo_cell.paragraphs[0]
+        logo_para.paragraph_format.space_after = Pt(0)
+        logo_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        logo_run = logo_para.add_run()
+        try:
+            # Cap by width; height will scale proportionally. Wide logos
+            # are bounded by the 1.4" width; very tall logos would push
+            # the cell taller, but most marketing logos are landscape.
+            logo_run.add_picture(logo, width=Inches(1.4))
+            # If the resulting picture is taller than ~0.8", clamp height
+            # by re-adding with explicit height instead.
+            try:
+                inline_shapes = [s for s in doc.inline_shapes]
+                if inline_shapes:
+                    last = inline_shapes[-1]
+                    # Only re-clamp if height exceeds 0.8" (730000 EMUs).
+                    if last.height and last.height > Inches(0.8):
+                        last.height = Inches(0.8)
+                        # Re-derive width to maintain aspect ratio is not
+                        # straightforward via python-docx; the cap on
+                        # height alone is acceptable since Word preserves
+                        # the embedded aspect ratio when only height is
+                        # set on an inline shape.
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            # Logo file is malformed — fail open, leave the cell empty.
+            pass
+
+        # Title cell.
+        title_cell = table.rows[0].cells[1]
+        title_para = title_cell.paragraphs[0]
+        title_para.paragraph_format.space_after = Pt(0)
+        title_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        # Vertically center the title against the logo.
+        try:
+            from docx.enum.table import WD_ALIGN_VERTICAL
+            title_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+            logo_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        except Exception:  # noqa: BLE001
+            pass
+        # "HubSpot Demo Prep: " in slightly muted (gray) weight, then
+        # company name in bold dark for emphasis. Keeping a colon avoids
+        # the em-dash style Jeremy reserves for published product brands.
+        r = title_para.add_run("HubSpot Demo Prep: ")
+        _set_run(r, color=GRAY, bold=False, size=22)
+        r = title_para.add_run(company_name)
+        _set_run(r, color=dark, bold=True, size=22)
+    else:
+        # No logo — title spans full width, full bold.
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        r = p.add_run("HubSpot Demo Prep: ")
+        _set_run(r, color=GRAY, bold=False, size=22)
+        r = p.add_run(company_name)
+        _set_run(r, color=dark, bold=True, size=22)
+
+    # Subtitle line: "Demo for {rep_name} · {Date} · Sandbox portal {portal}"
+    today = datetime.date.today().strftime("%B %-d, %Y")
+    rep = _rep_name(manifest, plan, research)
+    subtitle = f"Demo for {rep}  ·  {today}  ·  Sandbox portal {portal}"
+    sp = doc.add_paragraph()
+    sp.paragraph_format.space_before = Pt(2)
+    sp.paragraph_format.space_after = Pt(0)
+    sr = sp.add_run(subtitle)
+    _set_run(sr, color=GRAY, size=9)
+    # Thin colored rule beneath the subtitle.
+    _bottom_border(sp, color_hex="%02X%02X%02X" % (rule_color[0], rule_color[1], rule_color[2]))
+
+
 def _build_doc(manifest: dict, research: dict, plan: dict, *,
                slug: str, work_dir: str, portal: str) -> Document:
     company = plan.get("company") or {}
@@ -551,26 +693,11 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
 
     # ---------------- PAGE 1 ----------------
 
-    # Banner
-    banner = _banner_path(work_dir, slug)
-    if banner:
-        p = doc.add_paragraph()
-        p.paragraph_format.space_after = Pt(2)
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run()
-        try:
-            run.add_picture(banner, width=Inches(5.6))
-        except Exception:
-            # If the image is malformed, skip the banner rather than crash.
-            pass
-
-    # Title bar
-    p = doc.add_paragraph()
-    p.paragraph_format.space_after = Pt(0)
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    r = p.add_run("HubSpot Demo Prep")
-    _set_run(r, color=dark, bold=True, size=18)
-    _bottom_border(p, color_hex="%02X%02X%02X" % (accent[0], accent[1], accent[2]))
+    # Consulting-deliverable header: logo (if available) + title + subtitle
+    # + thin colored rule. Replaces the old generated banner. If no logo is
+    # present (older runs, missing logo_path), the title spans full width.
+    _render_header(doc, manifest, plan, research,
+                   company_name=company_name, portal=portal)
 
     # Time-saved hero stat (item 14). Renders nothing if manifest['time_saved']
     # is missing, so older runs and module failures degrade gracefully.
@@ -578,18 +705,6 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
         _render_time_saved_hero(doc, manifest, plan)
     except Exception:  # noqa: BLE001
         pass
-
-    # Subtitle line
-    today = datetime.date.today().strftime("%B %-d, %Y")
-    location = company.get("location") or company.get("hq") or ""
-    subtitle = f"{today}   ·   Sandbox {portal}   ·   Prepared for: {company_name}"
-    if location:
-        subtitle += f" ({location})"
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(2)
-    p.paragraph_format.space_after = Pt(4)
-    r = p.add_run(subtitle)
-    _set_run(r, color=GRAY, size=9)
 
     # Intro paragraph (rep input + what was built)
     rep_input = (research.get("stated_context") or "").strip()
@@ -905,7 +1020,7 @@ def _render_also_built(doc, *, manifest: dict, plan: dict, urls: dict, portal: s
 
     # Pipeline + deals
     if (manifest.get("pipeline") or {}).get("id"):
-        total = sum((d.get("amount") or 0) for d in (plan.get("deals") or []))
+        total = sum(_coerce_amount(d.get("amount")) for d in (plan.get("deals") or []))
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
         r = p.add_run(f"Active deal pipeline ({len(deals)} deals, {_format_currency(total)} total)  ▸  ")
@@ -1152,7 +1267,7 @@ def _build_inventory(manifest: dict, plan: dict) -> list[str]:
         items.append(f"{len(contacts)} contacts spanning roles{roles_clause}")
     deals = manifest.get("deals") or {}
     if deals:
-        total = sum((d.get("amount") or 0) for d in (plan.get("deals") or []))
+        total = sum(_coerce_amount(d.get("amount")) for d in (plan.get("deals") or []))
         pipeline_name = (manifest.get("pipeline") or {}).get("name") or "the custom pipeline"
         items.append(f"{len(deals)} deals across the {pipeline_name} ({_format_currency(total)} total ACV)")
     n_eng = manifest.get("engagements_count") or 0

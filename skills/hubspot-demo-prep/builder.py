@@ -275,9 +275,15 @@ class HubSpotClient:
         return 200 <= status < 300
 
     def form_submit(self, form_guid: str, body: dict) -> tuple[int, str]:
-        """Unauthenticated form submission endpoint."""
+        """Unauthenticated form submission endpoint.
+
+        Bug fix (2026-04-27): the v3 form-submission endpoint lives on
+        `api.hsforms.com`, not `api.hubapi.com`. Hitting api.hubapi.com
+        returns a 404 HTML page (not even a JSON error), which silently
+        zeroes out form_submissions_count for every demo run.
+        """
         self._throttle()
-        url = f"https://api.hubapi.com/submissions/v3/integration/submit/{self.portal}/{form_guid}"
+        url = f"https://api.hsforms.com/submissions/v3/integration/submit/{self.portal}/{form_guid}"
         headers = {"Content-Type": "application/json"}
         data = json.dumps(body).encode()
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -534,16 +540,69 @@ class Builder:
                 warn(f"contact {c['email']}: {s} {str(r)[:200]}")
                 self.add_error(f"contact.create:{c['email']}", s, r)
 
-        # Associate to company (parallel, but throttled by client)
+        # Associate to company — DEDUPED (parallel, but throttled by client).
+        #
+        # Fix D (2026-04-26): the v3 PUT association endpoint is *not* fully
+        # idempotent across re-runs in HubSpot's UI. When `_run_with_verify`
+        # retries `create_contacts` (because verify briefly returned False), or
+        # when the orchestrator re-runs `python3 builder.py <slug>` to repair a
+        # partial build (e.g. 1800LAW1010 was run 4 times), every execution of
+        # the loop below re-PUT the association — causing the contact record
+        # in HubSpot to show 4 separate "associated company" rows for what
+        # should be a single Primary association.
+        #
+        # Defense: GET the contact's existing company associations first; only
+        # PUT if the target `company_id` is NOT already in the result set.
+        # The same pattern applies anywhere we associate a contact to a
+        # company (currently only this site — see grep of associations/companies).
+        ok_count = 0
+        skip_count = 0
         with ThreadPoolExecutor(max_workers=5) as ex:
-            futures = []
+            futures = {}
             for cid in self.manifest["contacts"].values():
-                futures.append(ex.submit(
-                    self.client.request, "PUT",
-                    f"/crm/v3/objects/contacts/{cid}/associations/companies/{company_id}/{ASSOC['contact_to_company']}"
-                ))
-            ok_count = sum(1 for f in as_completed(futures) if self.client.is_ok(f.result()[0]))
-        ok(f"contact-company associations: {ok_count}/{len(self.manifest['contacts'])}")
+                futures[ex.submit(self._associate_contact_to_company_idempotent,
+                                  cid, company_id)] = cid
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result == "ok":
+                    ok_count += 1
+                elif result == "skip":
+                    skip_count += 1
+        ok(f"contact-company associations: {ok_count} created, {skip_count} already existed "
+           f"(total contacts: {len(self.manifest['contacts'])})")
+
+    def _associate_contact_to_company_idempotent(
+        self, contact_id: str, company_id: str
+    ) -> str:
+        """PUT contact→company association only when it doesn't already exist.
+
+        Returns one of:
+          - "skip"  — association already present; nothing PUT
+          - "ok"    — PUT succeeded
+          - "fail"  — PUT failed or pre-check raised
+
+        See Fix D commentary in `create_contacts` for why this matters.
+        """
+        try:
+            s, r = self.client.request(
+                "GET", f"/crm/v3/objects/contacts/{contact_id}/associations/companies"
+            )
+            if self.client.is_ok(s):
+                results = r.get("results", []) if isinstance(r, dict) else []
+                for assoc in results:
+                    # The v3 association payload returns `id` (string) for the
+                    # associated record; older shapes use `toObjectId`. Check both.
+                    target_id = str(assoc.get("id") or assoc.get("toObjectId") or "")
+                    if target_id == str(company_id):
+                        return "skip"
+            # Either GET failed (we PUT defensively) or association is missing.
+            ps, _ = self.client.request(
+                "PUT",
+                f"/crm/v3/objects/contacts/{contact_id}/associations/companies/{company_id}/{ASSOC['contact_to_company']}",
+            )
+            return "ok" if self.client.is_ok(ps) else "fail"
+        except Exception:  # noqa: BLE001 — never crash the parallel association loop
+            return "fail"
 
     # ---- Phase 4: Pipeline + deals + tickets ----
 
@@ -597,9 +656,22 @@ class Builder:
         stages_list = [{"label": st["label"], "id": st["id"]} for st in r.get("stages", [])]
         stage_map = {st["label"]: st["id"] for st in r.get("stages", [])}
 
+        # Pipeline board URL.
+        #
+        # v0.3.0 fix tried `?pipeline={id}` on the modern object-records URL.
+        # v0.3.1 walkthrough caught that this STILL doesn't auto-switch the
+        # board view — HubSpot's UI honors the user's last-viewed pipeline
+        # cookie and ignores the bare `?pipeline=` query string. The fix:
+        # use HubSpot's internal `pipelineId` query name (matches what the
+        # board's pipeline-picker writes when a user switches manually).
+        # Belt-and-suspenders: include both `?pipeline=` AND `?pipelineId=`
+        # so we hit whichever HubSpot's URL parser is currently honoring.
+        board_url = (f"https://app.hubspot.com/contacts/{self.portal}"
+                     f"/objects/0-3/views/all/board"
+                     f"?pipeline={pipeline_id}&pipelineId={pipeline_id}")
         self.manifest["pipeline"] = {
             "id": pipeline_id, "name": pipeline_plan["name"],
-            "url": f"https://app.hubspot.com/sales/{self.portal}/deals/board/view/all/?pipeline={pipeline_id}",
+            "url": board_url,
             "stages": stages_list,  # [{label, id}] — read by playwright_phases_extras saved-views builder
         }
 
@@ -609,7 +681,20 @@ class Builder:
         for i, d in enumerate(self.plan["deals"]):
             stage_id = stage_map.get(d["stage"])
             if not stage_id:
-                warn(f"deal {d['name']}: unknown stage {d['stage']}")
+                # Loud warning + actionable manual step. If `stage_map` is
+                # missing the planned stage label, the deal silently never
+                # gets created — which is precisely what made 1800LAW1010
+                # appear to have an "empty pipeline" on review even though
+                # the verifier passed (Fix C).
+                warn(f"deal {d['name']}: planned stage {d['stage']!r} not found "
+                     f"in pipeline {pipeline_plan['name']!r}; available stages: "
+                     f"{list(stage_map.keys())}")
+                self.add_error(
+                    f"deal.create:{d['name']}",
+                    0,
+                    f"unknown stage {d['stage']!r}; pipeline only offers "
+                    f"{list(stage_map.keys())}",
+                )
                 continue
             body = {"properties": {
                 "dealname": d["name"], "amount": str(d.get("amount", 5000)),
@@ -628,6 +713,37 @@ class Builder:
             if contact_ids:
                 self.client.request("PUT", f"/crm/v3/objects/deals/{did}/associations/contacts/{contact_ids[i % len(contact_ids)]}/{ASSOC['deal_to_contact']}")
             ok(f"deal {d['name']} → {did}")
+
+        # Post-build verification: GET each deal and confirm `pipeline` matches
+        # `pipeline_id`. If any deal slipped onto the default pipeline (rare,
+        # but caught the 1800LAW1010 walkthrough), PATCH it to the correct
+        # pipeline + first stage so the board view isn't empty. Fix C.
+        mismatches = []
+        for deal_name, did in list(self.manifest["deals"].items()):
+            sg, rg = self.client.request(
+                "GET", f"/crm/v3/objects/deals/{did}",
+                query={"properties": "pipeline,dealstage"},
+            )
+            if not self.client.is_ok(sg):
+                continue
+            actual_pipeline = (rg.get("properties") or {}).get("pipeline")
+            if actual_pipeline and str(actual_pipeline) != str(pipeline_id):
+                mismatches.append((deal_name, did, actual_pipeline))
+        if mismatches:
+            # First stage of the custom pipeline as the safe landing slot.
+            first_stage = stages_list[0]["id"] if stages_list else None
+            for deal_name, did, wrong_pipeline in mismatches:
+                warn(f"deal {deal_name} landed on pipeline {wrong_pipeline} "
+                     f"(expected {pipeline_id}); patching to {pipeline_id}")
+                patch_body = {"properties": {"pipeline": pipeline_id}}
+                if first_stage:
+                    patch_body["properties"]["dealstage"] = first_stage
+                ps, pr = self.client.request(
+                    "PATCH", f"/crm/v3/objects/deals/{did}", patch_body,
+                )
+                if not self.client.is_ok(ps):
+                    self.add_error(f"deal.repipeline:{deal_name}", ps, pr)
+            ok(f"repaired {len(mismatches)} deals onto pipeline {pipeline_id}")
 
     def create_tickets(self) -> None:
         if not self.plan.get("tickets"):
@@ -1235,18 +1351,35 @@ class Builder:
                     "fieldType": ftype,
                     "validation": _validation(fld["name"], ftype, fld),
                 }
-                # `dropdown` is the v3 API value (not `dropdown_select`); each
-                # option must include a `displayOrder` integer (verified
-                # 2026-04-27).
-                if ftype == "dropdown":
+                # `dropdown` and `radio` both require an `options` array in the
+                # v3 Forms API. Each option needs `label`, `value`, and a
+                # 1-indexed `displayOrder` integer (verified 2026-04-27).
+                # `radio` is the recommended type for NPS scales (1-10) — it
+                # surfaces a horizontal button-row UX that beats free-text
+                # entry on a `number` field. See Fix E1 (2026-04-26) and
+                # SKILL.md Phase 2 Quality Gate.
+                if ftype in ("dropdown", "radio"):
                     opts = fld.get("options") or []
+                    # NPS auto-population: if a radio field is named `nps_score`
+                    # (or the form is an NPS form and the field shape calls
+                    # for 1-10) and no options were provided, synthesize the
+                    # canonical 1-10 ladder so plans don't have to enumerate
+                    # ten dicts inline.
+                    if not opts and ftype == "radio":
+                        is_nps_field = (
+                            fld["name"].lower() in ("nps_score", "score")
+                            or (fld.get("min") == 1 and fld.get("max") == 10)
+                        )
+                        if is_nps_field:
+                            opts = [{"label": str(n), "value": str(n)}
+                                    for n in range(1, 11)]
                     norm_opts = []
                     for idx, o in enumerate(opts):
                         if isinstance(o, dict):
                             norm_opts.append({
                                 "label": str(o.get("label", o.get("value", ""))),
                                 "value": str(o.get("value", o.get("label", ""))),
-                                "displayOrder": idx + 1,
+                                "displayOrder": o.get("displayOrder", idx + 1),
                             })
                         else:
                             norm_opts.append({
@@ -1428,18 +1561,36 @@ class Builder:
                 declared = fld.get("field_type", "single_line_text")
                 ftype = DEFAULT_CONTACT_FIELD_TYPES.get(fname, declared)
 
-                # `dropdown` is the v3 API value (verified 2026-04-27).
-                if ftype == "dropdown":
+                # `dropdown` and `radio` both pick from `options` (verified
+                # 2026-04-27). The radio branch is the NPS-friendly path —
+                # see Fix E1 (2026-04-26): NPS forms now default to radio
+                # (1-10) instead of free-text number entry.
+                if ftype in ("dropdown", "radio"):
                     opts = fld.get("options") or []
+                    # Mirror the auto-population in `_build_form_body`: an NPS
+                    # radio field with no explicit options gets the 1-10 ladder.
+                    if not opts and ftype == "radio":
+                        is_nps_field = (
+                            fname.lower() in ("nps_score", "score")
+                            or (fld.get("min") == 1 and fld.get("max") == 10)
+                        )
+                        if is_nps_field:
+                            opts = [{"value": str(n)} for n in range(1, 11)]
                     if opts:
+                        # NPS bias: if the field is the NPS score field and we
+                        # have 1-10 options, weight by score_distribution so
+                        # the distribution looks realistic instead of uniform.
+                        if (is_nps and fname.lower() in ("nps_score", "score")
+                                and len(opts) == 10):
+                            return str(_nps_score_from_bucket(_nps_bucket()))
                         choice = random.choice(opts)
                         if isinstance(choice, dict):
                             return str(choice.get("value", choice.get("label", "")))
                         return str(choice)
-                    # Empty options on a dropdown is a plan bug — submitting "sample"
-                    # would 4xx and silently drop from form_submissions_count. Surface
-                    # it and skip this field entirely (omit from the submission).
-                    warn(f"form '{fp['name']}': dropdown field '{fname}' has empty options; "
+                    # Empty options on a dropdown/radio is a plan bug — submitting
+                    # "sample" would 4xx and silently drop from form_submissions_count.
+                    # Surface it and skip this field entirely (omit from the submission).
+                    warn(f"form '{fp['name']}': {ftype} field '{fname}' has empty options; "
                          f"skipping this field in test submissions to avoid 4xx")
                     return None  # caller filters None values out
 
@@ -1571,8 +1722,23 @@ class Builder:
 
     def upload_hero_image(self, local_path: str, folder: str = "/demo-prep") -> str | None:
         """Upload an image to HubSpot Files via REST API. Returns CDN URL."""
+        return self._upload_file_to_hubspot(local_path, folder, label="hero")
+
+    def upload_logo_image(self, local_path: str, folder: str = "/demo-prep") -> str | None:
+        """Upload the prospect's logo to HubSpot Files. Returns CDN URL.
+
+        Used by `marketing_email` to render the prospect's logo in a small
+        header strip above the hero image. See Fix F-builder (2026-04-26).
+        Mirrors `upload_hero_image` so we keep the multipart upload code in
+        a single helper and the two phases share one well-tested path.
+        """
+        return self._upload_file_to_hubspot(local_path, folder, label="logo")
+
+    def _upload_file_to_hubspot(
+        self, local_path: str, folder: str, label: str = "file",
+    ) -> str | None:
+        """Internal multipart upload helper. Returns CDN URL on success."""
         try:
-            import io
             import mimetypes
             mime, _ = mimetypes.guess_type(local_path)
             mime = mime or "image/png"
@@ -1604,7 +1770,7 @@ class Builder:
                 data = json.loads(r.read())
                 return data.get("url")
         except Exception as e:
-            warn(f"hero upload failed: {e}")
+            warn(f"{label} upload failed: {e}")
             return None
 
     def find_template_email_widgets(self) -> dict | None:
@@ -1643,6 +1809,32 @@ class Builder:
             except Exception as e:
                 warn(f"hero image fetch failed: {e}")
 
+        # Logo image for the email header strip (Fix F-builder, 2026-04-26).
+        # Always-on Playwright logo screenshot in Phase 1 lands at
+        # `plan["branding"]["logo_path"]`. Upload it to HubSpot Files now so
+        # both the hosted email and the saved local HTML can reference a CDN
+        # URL. We inline it as base64 in the local HTML for offline preview;
+        # the hosted email widget gets the CDN URL.
+        plan_brand_for_logo = self.plan.get("branding", {}) or {}
+        local_logo_path = (
+            plan_brand_for_logo.get("logo_path")
+            or (self.research.get("branding") or {}).get("logo_path")
+        )
+        logo_hubspot_url = None
+        logo_b64 = None
+        if local_logo_path and os.path.exists(local_logo_path):
+            with open(local_logo_path, "rb") as f:
+                logo_b64 = base64.b64encode(f.read()).decode()
+            logo_hubspot_url = self.upload_logo_image(
+                local_logo_path, folder=f"/demo-prep-{self.slug}"
+            )
+            if logo_hubspot_url:
+                ok(f"logo uploaded to HubSpot: {logo_hubspot_url}")
+                # Persist on the manifest so doc_generator + downstream
+                # phases can reference it without re-uploading.
+                self.manifest.setdefault("branding", {})["logo_url"] = logo_hubspot_url
+                self.manifest["branding"]["logo_path"] = local_logo_path
+
         # Branding: prefer plan["branding"] (locked schema), then research["branding"] (legacy),
         # then industry-neutral defaults. The old #FF6B35 fallback was Shipperz transport orange
         # and bled into every demo regardless of prospect.
@@ -1663,6 +1855,22 @@ class Builder:
         if hero_b64:
             hero_img_html = f'<img src="data:image/png;base64,{hero_b64}" alt="{company_name} hero" style="display:block;width:100%;height:auto;border-radius:8px;margin:0 0 24px 0">'
 
+        # Logo header strip (Fix F-builder). When we have the prospect's logo,
+        # render a centered top header above the hero image. This is the
+        # "top 10% / brand-consistent" detail that makes a demo email stop
+        # looking like a generic template. If no logo is available, we skip
+        # the strip entirely — no broken-image placeholder, no empty box.
+        logo_header_html = ""
+        if logo_b64:
+            logo_header_html = (
+                f'<div style="text-align:center;padding:24px 0 16px;'
+                f'border-bottom:1px solid #eee;">'
+                f'<img src="data:image/png;base64,{logo_b64}" '
+                f'alt="{company_name}" '
+                f'style="max-height:48px;width:auto;display:inline-block;">'
+                f'</div>'
+            )
+
         # CTA color: plan field wins, else branding primary. The legacy hardcoded
         # #FF6B35 leaked Shipperz transport orange into every demo's button.
         cta_color = me.get("cta_color") or primary
@@ -1670,11 +1878,25 @@ class Builder:
         cta_url = me.get("cta_url") or f"https://www.{self.plan['company']['domain']}"
         footer_tagline = me.get("footer_tagline") or company_name
 
+        # Standalone CTA block — always appended after body_html OR after the
+        # fallback steps. The v0.3.1 walkthrough caught that body_html-authored
+        # emails landed without a visible CTA because the CTA was only built
+        # inside the fallback branch. Now CTA always renders.
+        cta_block_html = (
+            f'<p style="text-align:center;margin:32px 0 24px 0;">'
+            f'<a href="{cta_url}" style="display:inline-block;background:{cta_color};color:#ffffff;'
+            f'text-decoration:none;padding:14px 28px;border-radius:6px;font-weight:600;'
+            f'font-size:16px;">{cta_text}</a>'
+            f'</p>'
+        )
+
         # Email body: prefer the LLM-authored body_html in the plan; else build a
         # generic, industry-neutral fallback from optional `steps`. The legacy
         # fallback hardcoded "vehicle and route" / "Day of pickup" / "auto transport".
         if me.get("body_html"):
-            body_inner_html = me["body_html"]
+            # body_html may not include its own CTA — always append the
+            # standalone CTA block so the email has a visible action.
+            body_inner_html = me["body_html"] + cta_block_html
         else:
             steps = me.get("steps") or [
                 {"timing": "Within 1 hour", "detail": "We confirm your details."},
@@ -1705,6 +1927,7 @@ class Builder:
 <html><head><meta charset="utf-8"><title>{me['subject']}</title></head>
 <body style="margin:0;padding:0;background:#f4f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
 <div style="max-width:640px;margin:0 auto;background:#ffffff;">
+  {logo_header_html}
   <div style="padding:24px 32px 0 32px;border-top:6px solid {primary};">
     <h1 style="margin:24px 0 8px 0;color:{primary};font-size:28px;line-height:1.2;font-weight:700;">{me['subject']}</h1>
     <p style="color:#666;font-size:14px;margin:0 0 24px 0;">From {me.get('from_name', company_name)}</p>
@@ -1758,15 +1981,39 @@ class Builder:
                     }
                     wbody["alignment"] = "center"
                 elif wbody.get("path") == "@hubspot/rich_text":
+                    # Logo header strip for the hosted email (Fix F-builder).
+                    # The CDN-hosted logo URL goes in front of the title so
+                    # the recipient sees the prospect's brand mark first. If
+                    # we never got a logo, this string is empty — no broken
+                    # image, no empty box.
+                    widget_logo_header = ""
+                    if logo_hubspot_url:
+                        widget_logo_header = (
+                            f'<div style="text-align:center;padding:24px 0 16px;'
+                            f'border-bottom:1px solid #eeeeee;margin-bottom:24px;">'
+                            f'<img src="{logo_hubspot_url}" alt="{company_name}" '
+                            f'style="max-height:48px;width:auto;display:inline-block;">'
+                            f'</div>'
+                        )
+
                     # Use plan body_html verbatim if provided; else build a generic
                     # industry-neutral widget body from optional `steps`. The legacy
                     # widget hardcoded "vehicle/route", "Day of pickup", and a
                     # #FF6B35 transport-orange CTA — all leaked into non-transport demos.
+                    # Same standalone-CTA fix as the local-HTML path above.
+                    widget_cta_html = (
+                        f'<p style="text-align:center;margin:32px 0 24px 0;">'
+                        f'<a href="{cta_url}" '
+                        f'style="display:inline-block;background:{cta_color};color:#fff;padding:14px 28px;'
+                        f'border-radius:6px;text-decoration:none;font-weight:600;font-size:16px;">{cta_text}</a></p>'
+                    )
                     if me.get("body_html"):
                         widget_html = (
+                            f'{widget_logo_header}'
                             f'<h1 style="text-align:center;color:#1a1a1a;font-size:28px;line-height:1.2;">'
                             f'{me["subject"]}</h1>'
                             f'{me["body_html"]}'
+                            f'{widget_cta_html}'
                         )
                     else:
                         steps = me.get("steps") or [
@@ -1779,6 +2026,7 @@ class Builder:
                             for s in steps
                         )
                         widget_html = (
+                            f'{widget_logo_header}'
                             f'<h1 style="text-align:center;color:#1a1a1a;font-size:28px;line-height:1.2;">'
                             f'{me["subject"]}</h1>'
                             f'<p style="font-size:16px;line-height:1.6;color:#1a1a1a;">'
@@ -3225,9 +3473,17 @@ class Builder:
         brand = (self.plan.get("brand") or {})
         plan_brand = self.plan.get("branding", {}) or {}
         research_brand = self.research.get("branding", {}) or {}
-        logo_path = brand.get(
-            "logo_path",
-            f"{self.work_dir}/{self.slug}-og.png",
+        # Bug fix (2026-04-27): logo_path was only read from the legacy
+        # plan["brand"] block, falling through to a non-existent
+        # `{slug}-og.png` default. The v0.3.0 schema puts the logo path on
+        # plan["branding"]["logo_path"] (Phase 1 records it from the
+        # always-on Playwright capture). Walk all three sources before the
+        # fallback so the portal-branding upload can actually find the file.
+        logo_path = (
+            brand.get("logo_path")
+            or plan_brand.get("logo_path")
+            or research_brand.get("logo_path")
+            or f"{self.work_dir}/{self.slug}-og.png"
         )
         primary_color = (brand.get("primary_color")
                          or plan_brand.get("primary_color")
@@ -3237,6 +3493,13 @@ class Builder:
                         or plan_brand.get("accent_color")
                         or research_brand.get("accent_color")
                         or "#3B82F6")
+        # v0.3.1: secondary color is optional — only applied if a tier
+        # supports a third Brand Kit slot or a designer-curated palette
+        # is provided in the plan/research blocks.
+        secondary_color = (brand.get("secondary_color")
+                           or plan_brand.get("secondary_color")
+                           or research_brand.get("secondary_color")
+                           or None)
         primary_keyword = brand.get("primary_keyword")
 
         results = playwright_phases.run_all_phases(
@@ -3245,6 +3508,7 @@ class Builder:
             logo_path=logo_path,
             primary_color=primary_color,
             accent_color=accent_color,
+            secondary_color=secondary_color,
             customer_name=customer_name,
             sender_email=sender_email,
             domain=domain,
