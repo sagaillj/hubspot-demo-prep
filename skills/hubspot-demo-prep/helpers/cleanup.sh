@@ -24,6 +24,22 @@ done
 
 info "Cleaning up demo assets tagged demo_customer=$SLUG (dry-run=$DRY_RUN)"
 
+# The Python builder owns the full v0.4 manifest-aware cleanup path (quotes,
+# invoices, line items, leads, campaign, custom object records/schema, calc
+# property/group). Keep the shell path below for dry-run visibility; real
+# cleanup delegates so this helper does not lag the builder contract again.
+if [[ "$DRY_RUN" != "true" ]]; then
+  python3 "$(dirname "$0")/../builder.py" cleanup "$SLUG"
+  ok "Cleanup pass complete for slug=$SLUG"
+  echo ""
+  warn "Not deleted automatically:"
+  warn "  - v0.4 reports/dashboards (HubSpot has no public delete API; remove from Reports UI if created)"
+  warn "  - Custom event definitions and shared demo properties (sandbox-wide)"
+  warn "  - Workflows / forms / marketing emails / landing pages that are UI-only or shared"
+  warn "  - Sample HubSpot contacts (Maria Johnson, Brian Halligan) — by design"
+  exit 0
+fi
+
 # Search for tagged objects across all standard CRM types
 find_and_delete() {
   local object_path="$1" object_label="$2"

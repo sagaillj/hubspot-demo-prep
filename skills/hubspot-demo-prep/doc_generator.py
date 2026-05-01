@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the per-prospect demo runbook .docx, then (optionally) upload to Google Drive.
+"""Generate the mode-aware demo/showcase runbook .docx, then upload to Google Drive when possible.
 
 The visual layout (banner, status pills, agenda block, easter egg, "also built",
 recommendation, page-2 supporting documentation) is fixed; all slug-specific
 copy, branding, and IDs come from build-plan.json, manifest.json, and
-research.json so the same generator works for any prospect.
+research.json so the same generator works for any prospect or feature showcase.
 
 Public API:
     generate_docx(manifest, research, plan, *, slug, work_dir, portal) -> str
@@ -85,6 +85,51 @@ def _accent_color(manifest: dict, plan: dict) -> RGBColor:
 def _dark_text(manifest: dict, plan: dict) -> RGBColor:
     """Return the prospect's body/title text color from branding.neutral_dark, else DARK_TEXT."""
     return _branding_color(manifest, plan, "neutral_dark", DARK_TEXT)
+
+
+# =====================================================================
+# Mode helpers
+# =====================================================================
+
+def _plan_mode(plan: dict | None) -> str:
+    mode = str((plan or {}).get("mode") or "demo").strip().lower().replace("-", "_")
+    if mode in {"feature", "showcase", "feature_showcase", "feature_showcase_mode"}:
+        return "feature_showcase"
+    return "demo"
+
+
+def _is_feature_showcase(plan: dict | None) -> bool:
+    return _plan_mode(plan) == "feature_showcase"
+
+
+def _feature_showcase(plan: dict | None, research: dict | None = None) -> dict:
+    for src in (plan, research):
+        if not isinstance(src, dict):
+            continue
+        block = src.get("feature_showcase")
+        if isinstance(block, dict):
+            return block
+    return {}
+
+
+def _text_list(value, *, limit: int = 6) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("label") or item.get("title") or item.get("name") or item.get("description")
+            else:
+                text = str(item)
+            if text and str(text).strip():
+                out.append(str(text).strip())
+            if len(out) >= limit:
+                break
+        return out
+    return [str(value).strip()] if str(value).strip() else []
 
 
 # =====================================================================
@@ -203,7 +248,14 @@ def _strip_phantom_numbers(text: str, manifest: dict, plan: dict) -> str:
                 return True
         return False
 
-    sentences = _ABBREV_LOOKBEHIND.split(text)
+    sentences: list[str] = []
+    pos = 0
+    for match in _ABBREV_LOOKBEHIND.finditer(text):
+        # Keep the sentence-ending period; the regex consumes ". " so a plain
+        # split would make the recommendation text read like a run-on.
+        sentences.append(text[pos:match.start() + 1])
+        pos = match.end()
+    sentences.append(text[pos:])
     kept: list[str] = []
     for sent in sentences:
         drop = False
@@ -383,8 +435,6 @@ def _hub_urls(portal: str, manifest: dict) -> dict:
         if "nps" in fname.lower():
             nps_form_id = fid
             break
-    if not nps_form_id and forms:
-        nps_form_id = next(iter(forms.values()))
     email_id = (manifest.get("marketing_email") or {}).get("id", "")
     lead_score_prop = (manifest.get("lead_scoring") or {}).get("property", "demo_lead_score")
     return {
@@ -401,6 +451,9 @@ def _hub_urls(portal: str, manifest: dict) -> dict:
         "lead_score_prop": f"https://app.hubspot.com/property-settings/{portal}/properties?type=0-1&property={lead_score_prop}",
         "tickets": f"https://app.hubspot.com/contacts/{portal}/objects/0-5/views/all/list",
         "event_defs": f"https://app.hubspot.com/events/{portal}/manage/event-definitions",
+        "campaigns_index": f"https://app.hubspot.com/marketing/{portal}/campaigns",
+        "dashboards_index": f"https://app.hubspot.com/reports-dashboard/{portal}",
+        "reports_index": f"https://app.hubspot.com/reports/{portal}",
     }
 
 
@@ -580,6 +633,8 @@ def _render_header(doc, manifest: dict, plan: dict, research: dict, *,
     # Use primary_color for the rule when available; else accent.
     rule_color = _branding_color(manifest, plan, "primary_color", _accent_color(manifest, plan))
     logo = _logo_path(manifest, plan)
+    feature_mode = _is_feature_showcase(plan)
+    title_prefix = "HubSpot Feature Showcase: " if feature_mode else "HubSpot Demo Prep: "
 
     if logo:
         table = doc.add_table(rows=1, cols=2)
@@ -638,10 +693,9 @@ def _render_header(doc, manifest: dict, plan: dict, research: dict, *,
             logo_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
         except Exception:  # noqa: BLE001
             pass
-        # "HubSpot Demo Prep: " in slightly muted (gray) weight, then
-        # company name in bold dark for emphasis. Keeping a colon avoids
-        # the em-dash style Jeremy reserves for published product brands.
-        r = title_para.add_run("HubSpot Demo Prep: ")
+        # Prefix in slightly muted (gray) weight, then company/showcase name
+        # in bold dark for emphasis.
+        r = title_para.add_run(title_prefix)
         _set_run(r, color=GRAY, bold=False, size=22)
         r = title_para.add_run(company_name)
         _set_run(r, color=dark, bold=True, size=22)
@@ -650,15 +704,16 @@ def _render_header(doc, manifest: dict, plan: dict, research: dict, *,
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        r = p.add_run("HubSpot Demo Prep: ")
+        r = p.add_run(title_prefix)
         _set_run(r, color=GRAY, bold=False, size=22)
         r = p.add_run(company_name)
         _set_run(r, color=dark, bold=True, size=22)
 
-    # Subtitle line: "Demo for {rep_name} · {Date} · Sandbox portal {portal}"
+    # Subtitle line: "Demo/Feature showcase for {rep_name} · {Date} · Sandbox portal {portal}"
     today = datetime.date.today().strftime("%B %-d, %Y")
     rep = _rep_name(manifest, plan, research)
-    subtitle = f"Demo for {rep}  ·  {today}  ·  Sandbox portal {portal}"
+    subtitle_prefix = "Feature showcase for" if feature_mode else "Demo for"
+    subtitle = f"{subtitle_prefix} {rep}  ·  {today}  ·  Sandbox portal {portal}"
     sp = doc.add_paragraph()
     sp.paragraph_format.space_before = Pt(2)
     sp.paragraph_format.space_after = Pt(0)
@@ -670,6 +725,8 @@ def _render_header(doc, manifest: dict, plan: dict, research: dict, *,
 
 def _build_doc(manifest: dict, research: dict, plan: dict, *,
                slug: str, work_dir: str, portal: str) -> Document:
+    feature_mode = _is_feature_showcase(plan)
+    feature = _feature_showcase(plan, research)
     company = plan.get("company") or {}
     company_name = company.get("name") or (manifest.get("company") or {}).get("name") or "Customer"
     urls = _hub_urls(portal, manifest)
@@ -706,12 +763,13 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     except Exception:  # noqa: BLE001
         pass
 
-    # Intro paragraph (rep input + what was built)
-    rep_input = (research.get("stated_context") or "").strip()
+    # Intro paragraph (rep input / showcase brief + what was built)
+    rep_input = (feature.get("story") if feature_mode else None) or (research.get("stated_context") or "")
+    rep_input = str(rep_input).strip()
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(0)
     if rep_input:
-        r = p.add_run("Rep input: ")
+        r = p.add_run("Showcase brief: " if feature_mode else "Rep input: ")
         _set_run(r, bold=True, size=9.5)
         r = p.add_run(rep_input + "  ")
         _set_run(r, italic=True, color=GRAY, size=9.5)
@@ -721,8 +779,9 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     r = p.add_run(built_summary)
     _set_run(r, size=9.5)
 
-    # ---- AGENDA ----
-    _h2(doc, "Agenda (from sales rep)", color=accent, before=8)
+    # ---- AGENDA / SHOWCASE FLOW ----
+    _h2(doc, "Showcase flow" if feature_mode else "Agenda (from sales rep)",
+        color=accent, before=8)
     for i, item in enumerate(agenda, 1):
         _render_agenda_item(doc, i, item, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
@@ -730,12 +789,20 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     if easter:
         _render_easter_egg(doc, easter, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
+    # ---- REPORTING & DASHBOARDS (v0.4) ----
+    _render_reports_section(doc, manifest=manifest, plan=plan, urls=urls, portal=portal)
+
     # ---- ALSO BUILT ----
-    _h2(doc, "Also built (pull these into the demo if useful)", color=accent, before=8)
+    also_title = (
+        "Also built (pull these into the showcase if useful)"
+        if feature_mode else "Also built (pull these into the demo if useful)"
+    )
+    _h2(doc, also_title, color=accent, before=8)
     _render_also_built(doc, manifest=manifest, plan=plan, urls=urls, portal=portal)
 
     # ---- RECOMMENDATION ----
-    _h2(doc, "Recommendation", color=accent, before=6)
+    _h2(doc, "How to tell the story" if feature_mode else "Recommendation",
+        color=accent, before=6)
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(0)
     r = p.add_run(_recommendation_text(manifest, plan))
@@ -746,25 +813,40 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(14)
     p.paragraph_format.space_after = Pt(2)
-    r = p.add_run("Supporting documentation")
+    r = p.add_run("Showcase support" if feature_mode else "Supporting documentation")
     _set_run(r, color=dark, bold=True, size=16)
     _bottom_border(p, color_hex="%02X%02X%02X" % (accent[0], accent[1], accent[2]))
 
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(6)
-    r = p.add_run("Reference material for the demo. Page 1 is the runbook; this page is your context cheat-sheet.")
+    support_copy = (
+        "Reference material for the feature story. Page 1 is the showcase flow; this page is the context cheat-sheet."
+        if feature_mode
+        else "Reference material for the demo. Page 1 is the runbook; this page is your context cheat-sheet."
+    )
+    r = p.add_run(support_copy)
     _set_run(r, color=GRAY, size=9)
 
-    # Pre-demo checklist
-    _h2(doc, "Pre-demo checklist", color=accent, before=2)
+    # Pre-demo / pre-showcase checklist
+    _h2(doc, "Pre-showcase checklist" if feature_mode else "Pre-demo checklist",
+        color=accent, before=2)
     _render_checklist(doc, manifest=manifest, urls=urls, portal=portal)
 
-    # Company snapshot
-    _h2(doc, f"{company_name} snapshot", color=accent, before=8)
-    _render_snapshot(doc, company=company, research=research)
+    # Company snapshot / feature brief
+    if feature_mode:
+        _h2(doc, "Feature showcase brief", color=accent, before=8)
+        _render_feature_showcase_brief(doc, feature=feature, company=company, research=research)
+        if plan.get("campaign_attribution_showcase"):
+            _h2(doc, "Attribution story map", color=accent, before=8)
+            _render_attribution_story_map(doc, plan=plan)
+    else:
+        _h2(doc, f"{company_name} snapshot", color=accent, before=8)
+        _render_snapshot(doc, company=company, research=research)
 
     # ICP / research
-    _h2(doc, "ICP and pain-point research (Perplexity, sonar)", color=accent, before=8)
+    _h2(doc,
+        "Story and audience context" if feature_mode else "ICP and pain-point research (Perplexity, sonar)",
+        color=accent, before=8)
     _render_icp(doc, research=research, plan=plan)
 
     # Full inventory
@@ -807,7 +889,7 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(10)
     p.paragraph_format.space_after = Pt(0)
-    r = p.add_run("When done with this demo: ")
+    r = p.add_run("When done with this showcase: " if feature_mode else "When done with this demo: ")
     _set_run(r, color=GRAY, italic=True, size=9)
     mono = p.add_run(f"python3 ~/.claude/skills/hubspot-demo-prep/builder.py cleanup {slug}")
     mono.font.name = "Menlo"
@@ -822,6 +904,7 @@ def _build_doc(manifest: dict, research: dict, plan: dict, *,
 # =====================================================================
 
 def _built_summary(manifest: dict, plan: dict) -> str:
+    feature_mode = _is_feature_showcase(plan)
     parts = []
     n_contacts = len(manifest.get("contacts") or {})
     n_engagements = manifest.get("engagements_count") or 0
@@ -834,25 +917,45 @@ def _built_summary(manifest: dict, plan: dict) -> str:
         parts.append(f"a {n_deals}-deal pipeline")
     if (manifest.get("custom_object") or {}).get("name"):
         parts.append(f"a custom {manifest['custom_object']['name']} object")
+    event_fires = int(manifest.get("custom_events_fired_count") or 0)
+    if event_fires:
+        parts.append(f"{event_fires} custom event fires")
     if manifest.get("forms"):
         parts.append("a live NPS survey" if any("nps" in n.lower() for n in manifest["forms"]) else "a live form")
     if (manifest.get("marketing_email") or {}).get("name") or (manifest.get("marketing_email") or {}).get("html_path"):
-        parts.append("a branded marketing email with AI hero image")
+        hero_present = bool(
+            (manifest.get("marketing_email") or {}).get("hero_image_url")
+            or (plan.get("marketing_email") or {}).get("hero_image_path")
+            or (plan.get("marketing_email") or {}).get("hero_image_url")
+        )
+        parts.append(
+            "a branded marketing email with AI hero image"
+            if hero_present else "a branded marketing email"
+        )
     if (manifest.get("lead_scoring") or {}).get("property"):
         backfilled = manifest["lead_scoring"].get("backfilled") or n_contacts
         parts.append(f"lead scoring on all {backfilled} contacts")
-    company_name = (plan.get("company") or {}).get("name") or "the prospect"
-    summary = f"activity-rich {company_name} portal with " + ", ".join(parts) + "."
+    if manifest.get("dashboards_v04"):
+        parts.append(f"{len(manifest.get('dashboards_v04') or {})} reporting dashboard(s)")
+    company_name = (plan.get("company") or {}).get("name") or (
+        "the showcase" if feature_mode else "the prospect"
+    )
+    descriptor = "showcase-ready" if feature_mode else "activity-rich"
+    summary = (
+        f"{descriptor} {company_name} portal with " + ", ".join(parts) + "."
+        if parts else f"{descriptor} {company_name} portal."
+    )
     if manifest.get("manual_steps"):
         n_workflow_manual = sum(1 for ms in manifest["manual_steps"]
                                 if "workflow" in (ms.get("item") or "").lower())
         if n_workflow_manual:
             summary += (f" {n_workflow_manual} workflow step(s) are built in the UI for finer control "
-                        "over branching/timing (60 seconds each — called out per agenda item below).")
+                        "over branching/timing (60 seconds each — called out below).")
     return summary
 
 
-def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, portal: str) -> list[tuple[str, RGBColor, str, str]]:
+def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, portal: str,
+                         plan: dict | None = None) -> list[tuple[str, RGBColor, str, str, str]]:
     """For each agenda item produce a list of (pill_label, pill_color, body_text, link_url[, link_text]).
 
     Falls back to a generic 'open in HubSpot' link from agenda.show_label.
@@ -879,6 +982,7 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
     has_email = (_verified("marketing_email")
                  and bool((manifest.get("marketing_email") or {}).get("name")
                           or (manifest.get("marketing_email") or {}).get("html_path")))
+    has_email_hero = bool((manifest.get("marketing_email") or {}).get("hero_image_url"))
     has_workflows = _verified("workflows") and bool(manifest.get("workflows"))
     has_landing = bool(manifest.get("landing_page"))
 
@@ -891,8 +995,12 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
 
     if "nurtur" in title_l or "drip" in title_l or "follow-up" in title_l:
         if has_email:
+            email_label = (
+                "Branded marketing email with AI hero image"
+                if has_email_hero else "Branded marketing email"
+            )
             lines.append(("BUILT", SUCCESS_GREEN,
-                          "Branded marketing email with AI hero image  ▸  ",
+                          f"{email_label}  ▸  ",
                           urls["email"], "Open email in HubSpot"))
         if not has_workflows:
             lines.append(("BUILD LIVE", WARN_AMBER,
@@ -921,6 +1029,24 @@ def _agenda_status_lines(item: dict, idx: int, manifest: dict, urls: dict, porta
                           "Routing workflow (built manually for finer control over branching/timing)  ▸  ",
                           routing_wf_url, "Open workflow"))
     else:
+        if _is_feature_showcase(plan):
+            link_label = item.get("show_label") or "Open in HubSpot"
+            link_url = ""
+            if "deal" in title_l and (manifest.get("deals") or {}):
+                _, first_deal_id = next(iter((manifest.get("deals") or {}).items()))
+                link_url = _deal_url(portal, first_deal_id)
+            elif "campaign" in title_l and manifest.get("campaign_url"):
+                link_url = manifest.get("campaign_url")
+            elif "dashboard" in title_l or "report" in title_l or "attribution" in title_l:
+                link_url = urls.get("dashboards_index") or urls.get("reports_index")
+            elif manifest.get("contacts"):
+                _, first_contact_id = next(iter((manifest.get("contacts") or {}).items()))
+                link_url = _contact_url(portal, first_contact_id)
+            else:
+                link_url = urls.get("contacts_list")
+            lines.append(("BUILT", SUCCESS_GREEN, "  ▸  ", link_url, link_label))
+            return lines
+
         # Generic fallback — single line with whatever URL we can derive
         link_label = item.get("show_label") or "Open in HubSpot"
         link_url = generic_wf_url
@@ -959,7 +1085,7 @@ def _render_agenda_item(doc, idx: int, item: dict, *, manifest: dict, plan: dict
         _set_run(r, color=GRAY, italic=True, size=9.5)
 
     # Status lines
-    for pill, color, body, link_url, link_label in _agenda_status_lines(item, idx, manifest, urls, portal):
+    for pill, color, body, link_url, link_label in _agenda_status_lines(item, idx, manifest, urls, portal, plan):
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.left_indent = Inches(0.22)
@@ -990,7 +1116,10 @@ def _render_easter_egg(doc, easter: dict, *, manifest: dict, plan: dict | None =
     p.paragraph_format.space_before = Pt(7)
     p.paragraph_format.space_after = Pt(0)
     _shade_paragraph(p, tint_hex, accent_hex)
-    r = p.add_run(f"★  EASTER EGG  ·  {title}")
+    section_label = easter.get("section_label") or (
+        "ADJACENT VALUE" if _is_feature_showcase(plan) else "EASTER EGG"
+    )
+    r = p.add_run(f"★  {section_label.upper()}  ·  {title}")
     _set_run(r, color=accent, bold=True, size=10)
 
     p = doc.add_paragraph()
@@ -1012,6 +1141,117 @@ def _render_easter_egg(doc, easter: dict, *, manifest: dict, plan: dict | None =
         sep = p.add_run("  ·  ")
         _set_run(sep, color=LIGHT_GRAY, size=9.5)
     _add_hyperlink(p, urls["lead_score_prop"], "Property settings", size=9.5)
+
+
+def _render_reports_section(doc, *, manifest: dict, plan: dict, urls: dict, portal: str) -> None:
+    """v0.4: render the Reporting & Dashboards section.
+
+    Reads manifest["dashboards_v04"] (populated by the Playwright reports
+    phase) and renders each dashboard with audience label + clickable URL,
+    plus a sub-line listing the report count and visualization mix. Surfaces
+    tier substitutions and the attribution-toggle pre-stage warning when
+    relevant. No-op when no v0.4 dashboards exist (preserves backward
+    compatibility with v0.3.0 plans).
+    """
+    dashboards = manifest.get("dashboards_v04") or {}
+    reports_status = manifest.get("reports_status") or {}
+    planned_dashboards = ((plan or {}).get("playwright_reports") or {}).get("dashboards") or []
+    if not dashboards and not reports_status and not planned_dashboards:
+        return
+
+    # Group reports by their owning dashboard. Prefer explicit dashboard_name;
+    # otherwise split from the right so dashboard names containing "::" survive.
+    reports_by_dash: dict[str, list[dict]] = {}
+    for key, info in (manifest.get("reports") or {}).items():
+        info = info or {}
+        dash_name = info.get("dashboard_name")
+        if not dash_name and "::" in str(key):
+            dash_name = str(key).rsplit("::", 1)[0]
+        if not dash_name:
+            continue
+        reports_by_dash.setdefault(dash_name, []).append(info)
+
+    accent = _accent_color(manifest, plan or {})
+
+    _h2(doc, "Reporting & dashboards", color=accent, before=8)
+
+    if not dashboards:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(2)
+        rb = p.add_run("Planned but not built: ")
+        _set_run(rb, bold=True, color=accent, size=9.5)
+        reason = reports_status.get("reason") or (
+            f"{len(planned_dashboards)} v0.4 dashboard(s) planned, but no dashboard URLs were recorded."
+        )
+        rt = p.add_run(reason)
+        _set_run(rt, color=GRAY, size=9.5)
+        if urls.get("dashboards_index"):
+            sep = p.add_run("  ·  ")
+            _set_run(sep, color=LIGHT_GRAY, size=9.5)
+            _add_hyperlink(p, urls["dashboards_index"], "All dashboards", size=9.5)
+        return
+
+    for dash_name, dash_info in dashboards.items():
+        dash_info = dash_info or {}
+        reports_for_this = reports_by_dash.get(dash_name, [])
+        viz_types = sorted({
+            (r.get("viz_type") or "").replace("_", " ")
+            for r in reports_for_this
+            if r.get("viz_type")
+        })
+        substituted = sum(1 for r in reports_for_this if r.get("tier_substituted"))
+
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        audience = dash_info.get("audience") or ""
+        label = f"{dash_name}" + (f"  ({audience})" if audience else "")
+        r = p.add_run(label + "  ▸  ")
+        _set_run(r, bold=True, size=10)
+        if dash_info.get("url"):
+            _add_hyperlink(p, dash_info["url"], "Open dashboard", size=10)
+        if urls.get("dashboards_index"):
+            sep_run = p.add_run("  ·  ")
+            _set_run(sep_run, color=LIGHT_GRAY, size=10)
+            _add_hyperlink(p, urls["dashboards_index"], "All dashboards", size=10)
+
+        # Sub-line: report count + viz mix + substitution note
+        sub = doc.add_paragraph()
+        sub.paragraph_format.space_after = Pt(2)
+        sub.paragraph_format.left_indent = Inches(0.22)
+        rcount = dash_info.get("report_count") or len(reports_for_this)
+        if viz_types:
+            viz_summary = ", ".join(viz_types)
+        elif reports_for_this:
+            viz_summary = "report mix recorded without visualization labels"
+        else:
+            viz_summary = "report manifest missing — verify this dashboard before demo"
+        substitution_note = ""
+        if substituted > 0:
+            substitution_note = (
+                f"  ·  {substituted} tier-substituted "
+                "(Sankey → vertical funnel on this sandbox)"
+            )
+        rline = sub.add_run(f"{rcount} reports — {viz_summary}{substitution_note}")
+        _set_run(rline, color=GRAY, size=9)
+
+    # Surface attribution-toggle pre-stage warning if any report uses it.
+    needs_attribution = any(
+        (r.get("data_source") or "") == "attribution"
+        for reports in reports_by_dash.values()
+        for r in reports
+    )
+    if needs_attribution:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after = Pt(0)
+        rb = p.add_run("Pre-stage required: ")
+        _set_run(rb, bold=True, color=accent, size=9)
+        rt = p.add_run(
+            "Multi-touch attribution reports reprocess for up to 2 days when an event "
+            "is first toggled as an interaction type. Flip the toggle ≥48h before the "
+            "demo to ensure the chart populates."
+        )
+        _set_run(rt, size=9, color=GRAY)
 
 
 def _render_also_built(doc, *, manifest: dict, plan: dict, urls: dict, portal: str) -> None:
@@ -1048,14 +1288,17 @@ def _render_also_built(doc, *, manifest: dict, plan: dict, urls: dict, portal: s
 
     # Activity-rich CRM with contact links
     n_engagements = manifest.get("engagements_count") or 0
-    n_events = sum(int(e.get("test_submissions") or 0) for e in (plan.get("custom_events") or []))
+    n_events = int(manifest.get("custom_events_fired_count") or 0)
+    if not n_events:
+        n_events = sum(int(e.get("test_submissions") or 0) for e in (plan.get("custom_events") or []))
     backdate_days = (plan.get("activity") or {}).get("backdate_days", 120)
     if contacts:
+        crm_label = "Record-rich CRM" if _is_feature_showcase(plan) else "Activity-rich CRM"
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
         events_clause = f" + {n_events} custom event fires" if n_events else ""
         r = p.add_run(
-            f"Activity-rich CRM ({len(contacts)} contacts, {n_engagements} engagements{events_clause}, "
+            f"{crm_label} ({len(contacts)} contacts, {n_engagements} engagements{events_clause}, "
             f"backdated {backdate_days} days)  ▸  "
         )
         _set_run(r, bold=True, size=10)
@@ -1089,11 +1332,46 @@ def _render_also_built(doc, *, manifest: dict, plan: dict, urls: dict, portal: s
     custom_events = manifest.get("custom_events") or {}
     if custom_events:
         ev_name = next(iter(custom_events.keys()))
+        flow_count = len(manifest.get("custom_event_flows") or {})
+        fired_count = int(manifest.get("custom_events_fired_count") or 0)
+        prefix = (
+            f"Custom event flows: {flow_count} ({fired_count} fires)  "
+            if flow_count else f"Custom event definition: {ev_name}  "
+        )
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(0)
-        r = p.add_run(f"Custom event definition: {ev_name}  ▸  ")
+        r = p.add_run(prefix + "▸  ")
         _set_run(r, bold=True, size=10)
         _add_hyperlink(p, urls["event_defs"], "Event definitions", size=10)
+
+    # Marketing campaign(s)
+    campaigns = manifest.get("campaigns") or {}
+    if campaigns:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(f"Marketing campaigns ({len(campaigns)})  ▸  ")
+        _set_run(r, bold=True, size=10)
+        items = list(campaigns.items())
+        for i, (campaign_name, cinfo) in enumerate(items[:6]):
+            cinfo = cinfo or {}
+            label = str(campaign_name)
+            role = cinfo.get("role") or ""
+            if role and role != "primary":
+                label += f" ({role.replace('_', ' ')})"
+            _add_hyperlink(p, cinfo.get("url") or urls.get("campaigns_index", ""), label, size=10)
+            if i < min(len(items), 6) - 1:
+                sep = p.add_run("  ·  ")
+                _set_run(sep, color=LIGHT_GRAY, size=10)
+    elif manifest.get("campaign_id"):
+        campaign_name = ((plan.get("marketing_campaign") or {}).get("name")
+                         or "Marketing campaign")
+        campaign_url = manifest.get("campaign_url") or urls.get("campaigns_index", "")
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(f"Marketing campaign: {campaign_name}  ▸  ")
+        _set_run(r, bold=True, size=10)
+        if campaign_url:
+            _add_hyperlink(p, campaign_url, "Open campaign", size=10)
 
     # Tickets
     tickets = manifest.get("tickets") or {}
@@ -1124,6 +1402,37 @@ def _recommendation_text(manifest: dict, plan: dict) -> str:
     supplied = plan.get("recommendation_text") if isinstance(plan, dict) else None
     if isinstance(supplied, str) and supplied.strip():
         return _strip_phantom_numbers(supplied.strip(), manifest, plan)
+
+    if _is_feature_showcase(plan):
+        feature = _feature_showcase(plan)
+        features = _text_list(feature.get("requested_features") or feature.get("features"), limit=3)
+        shot_list = _text_list(feature.get("shot_list"), limit=3)
+        agenda_titles = [
+            item.get("title") for item in (plan.get("agenda") or [])
+            if isinstance(item, dict) and item.get("title")
+        ][:3]
+        if shot_list:
+            first_shot = shot_list[0].rstrip(".")
+            remaining = ", ".join(s.rstrip(".") for s in shot_list[1:])
+            text = (
+                f"Start here: {first_shot}. "
+                f"Then move through {remaining if remaining else 'the built HubSpot artifacts'} "
+                "so the audience sees the feature working through real records, not a feature list."
+            )
+        elif agenda_titles:
+            text = (
+                f"Lead with {agenda_titles[0]}. "
+                f"Then use {'; '.join(agenda_titles[1:]) if len(agenda_titles) > 1 else 'the linked artifacts'} "
+                "as the recording path. Keep the narration anchored on the data changing hands between records."
+            )
+        else:
+            feature_label = ", ".join(features) if features else "the requested feature"
+            text = (
+                f"Lead with the cleanest sample record for {feature_label}. "
+                "Open each linked artifact in the doc in order, and close on the adjacent-value item "
+                "as the practical next step."
+            )
+        return _strip_phantom_numbers(text, manifest, plan)
 
     # Generic fallback — only manifest-derived values, no industry copy
     contacts = list((manifest.get("contacts") or {}).items())
@@ -1174,8 +1483,9 @@ def _render_checklist(doc, *, manifest: dict, urls: dict, portal: str) -> None:
         checks.append(("Open the ", "deal pipeline board view", urls["pipeline_board"],
                        " and verify all deals show across stages"))
     if (manifest.get("marketing_email") or {}).get("id") or (manifest.get("marketing_email") or {}).get("name"):
+        has_hero = bool((manifest.get("marketing_email") or {}).get("hero_image_url"))
         checks.append(("Open the ", "marketing email", urls["email"],
-                       " and confirm the AI hero image renders"))
+                       " and confirm the AI hero image renders" if has_hero else " and confirm the branded copy renders"))
     if urls.get("nps_form"):
         checks.append(("Open the ", "NPS survey form", urls["nps_form"],
                        " and verify the questions look right"))
@@ -1193,6 +1503,111 @@ def _render_checklist(doc, *, manifest: dict, urls: dict, portal: str) -> None:
         _add_hyperlink(p, url, link_text, size=10)
         r = p.add_run(suffix)
         _set_run(r, size=10)
+
+
+def _render_feature_showcase_brief(doc, *, feature: dict, company: dict, research: dict) -> None:
+    """Render the story/feature brief for Feature Showcase mode."""
+    rows: list[tuple[str, str]] = []
+    story = feature.get("story") or research.get("stated_context")
+    if story:
+        rows.append(("Story", str(story)[:900]))
+    features = _text_list(feature.get("requested_features") or feature.get("features"))
+    if features:
+        rows.append(("Features", ", ".join(features)))
+    audience = feature.get("audience") or research.get("audience")
+    if audience:
+        rows.append(("Audience", str(audience)))
+    criteria = _text_list(feature.get("success_criteria"), limit=5)
+    if criteria:
+        rows.append(("Success criteria", "; ".join(criteria)))
+    artifact_goals = _text_list(feature.get("artifact_goals"), limit=5)
+    if artifact_goals:
+        rows.append(("Artifact goals", "; ".join(artifact_goals)))
+    shot_list = _text_list(feature.get("shot_list"), limit=6)
+    if shot_list:
+        rows.append(("Shot list", "; ".join(shot_list)))
+    if feature.get("easter_egg_strategy"):
+        rows.append(("Adjacent value", str(feature["easter_egg_strategy"])[:500]))
+
+    rs_company = research.get("company") or {}
+    domain = company.get("domain") or rs_company.get("domain")
+    if domain:
+        rows.append(("Brand context", domain))
+
+    if not rows:
+        rows.append(("Mode", "Feature Showcase"))
+
+    for k, v in rows:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.left_indent = Inches(0.05)
+        r = p.add_run(f"{k}: ")
+        _set_run(r, bold=True, size=9.5)
+        r = p.add_run(str(v))
+        _set_run(r, size=9.5)
+
+
+def _render_attribution_story_map(doc, *, plan: dict) -> None:
+    """Render a compact map of the campaign attribution showcase plan."""
+    block = plan.get("campaign_attribution_showcase") or {}
+    if not isinstance(block, dict):
+        return
+
+    rows: list[tuple[str, str]] = []
+    campaigns = block.get("campaigns") or []
+    if campaigns:
+        labels = []
+        for campaign in campaigns[:5]:
+            if not isinstance(campaign, dict):
+                continue
+            name = campaign.get("name") or "Campaign"
+            source = campaign.get("source") or campaign.get("role") or ""
+            role = campaign.get("role") or ""
+            detail = " / ".join([str(x) for x in (source, role) if x])
+            labels.append(f"{name} ({detail})" if detail else str(name))
+        if labels:
+            rows.append(("Campaign mix", "; ".join(labels)))
+
+    contact_paths = block.get("contact_paths") or []
+    if contact_paths:
+        examples = []
+        for path in contact_paths[:4]:
+            if not isinstance(path, dict):
+                continue
+            contact = path.get("contact_email") or path.get("contact") or "sample contact"
+            first = path.get("first_touch_campaign") or "first touch"
+            last = path.get("last_touch_campaign") or "last touch"
+            deal = path.get("deal_name") or "associated deal"
+            revenue = path.get("revenue")
+            rev = f" ({_format_currency(revenue)})" if revenue else ""
+            examples.append(f"{contact}: {first} → {last} → {deal}{rev}")
+        if examples:
+            rows.append(("Contact paths", "; ".join(examples)))
+
+    rollup = block.get("deal_campaign_rollup") or {}
+    if isinstance(rollup, dict) and rollup:
+        method = rollup.get("method") or "workflow/manual step"
+        workflow = rollup.get("workflow_name") or ""
+        props = _text_list(rollup.get("deal_properties"), limit=6)
+        detail = method
+        if workflow:
+            detail += f" · {workflow}"
+        if props:
+            detail += f" · deal fields: {', '.join(props)}"
+        rows.append(("Deal rollup", detail))
+
+    reports = _text_list(block.get("reports"), limit=6)
+    if reports:
+        rows.append(("Report targets", "; ".join(reports)))
+
+    for k, v in rows:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.left_indent = Inches(0.05)
+        r = p.add_run(f"{k}  ▸  ")
+        _set_run(r, bold=True, size=9.5)
+        r = p.add_run(str(v))
+        _set_run(r, size=9.5)
 
 
 def _render_snapshot(doc, *, company: dict, research: dict) -> None:
@@ -1228,6 +1643,18 @@ def _render_snapshot(doc, *, company: dict, research: dict) -> None:
 def _render_icp(doc, *, research: dict, plan: dict) -> None:
     """Pull the Perplexity research summary into a few tight bullets."""
     rows: list[tuple[str, str]] = []
+    if _is_feature_showcase(plan):
+        feature = _feature_showcase(plan, research)
+        features = _text_list(feature.get("requested_features") or feature.get("features"), limit=5)
+        if features:
+            rows.append(("Requested feature story", ", ".join(features)))
+        audience = feature.get("audience")
+        if audience:
+            rows.append(("Audience", str(audience)))
+        criteria = _text_list(feature.get("success_criteria"), limit=4)
+        if criteria:
+            rows.append(("What good looks like", "; ".join(criteria)))
+
     perp = research.get("perplexity") or {}
     if perp.get("choices"):
         # Just include a top-line statement if we can derive one.
@@ -1276,7 +1703,9 @@ def _build_inventory(manifest: dict, plan: dict) -> list[str]:
         items.append(f"{n_eng} timeline engagements (notes, calls, tasks, meetings, emails) backdated {days} days for a lived-in feel")
     custom_events = manifest.get("custom_events") or {}
     if custom_events:
-        n_events = sum(int(e.get("test_submissions") or 0) for e in (plan.get("custom_events") or []))
+        n_events = int(manifest.get("custom_events_fired_count") or 0)
+        if not n_events:
+            n_events = sum(int(e.get("test_submissions") or 0) for e in (plan.get("custom_events") or []))
         ev_name = next(iter(custom_events.keys()))
         items.append(f"{n_events} custom event fires ({ev_name}) on contact records" if n_events
                      else f"Custom event definition ({ev_name}) wired to contact records")
@@ -1290,15 +1719,32 @@ def _build_inventory(manifest: dict, plan: dict) -> list[str]:
         items.append(f"1 form (live, embeddable): {fname}")
     me = manifest.get("marketing_email") or {}
     if me.get("name") or me.get("html_path"):
-        items.append("1 branded marketing email (live in HubSpot) with AI-generated hero image")
+        hero_clause = " with AI-generated hero image" if me.get("hero_image_url") else ""
+        items.append(f"1 branded marketing email (live in HubSpot){hero_clause}")
+    campaigns = manifest.get("campaigns") or {}
+    if campaigns:
+        items.append(f"{len(campaigns)} marketing campaign records linked to demo assets")
     ls = manifest.get("lead_scoring") or {}
     if ls.get("property"):
         items.append(f"1 custom property ({ls['property']}, 0-100) backfilled on all {ls.get('backfilled') or len(contacts)} contacts")
     if ls.get("list_id"):
         items.append("1 lead-scoring contact list (Hot Leads by score)")
+    attr = manifest.get("campaign_attribution_showcase") or {}
+    if attr:
+        items.append(
+            "Campaign attribution showcase fields patched on "
+            f"{attr.get('contacts_patched', 0)} contact(s) and "
+            f"{attr.get('deals_patched', 0)} deal(s)"
+        )
     tickets = manifest.get("tickets") or {}
     if tickets:
         items.append(f"{len(tickets)} support tickets (sample customer issues)")
+    dashboards = manifest.get("dashboards_v04") or {}
+    reports_status = manifest.get("reports_status") or {}
+    if dashboards:
+        items.append(f"{len(dashboards)} v0.4 reporting dashboard(s) with {len(manifest.get('reports') or {})} report manifest entries")
+    elif reports_status:
+        items.append(f"v0.4 reporting dashboard plan recorded ({reports_status.get('status', 'not built')})")
     return items
 
 
@@ -1320,6 +1766,8 @@ def _build_limitations(manifest: dict) -> list[str]:
             limits.append("Quote form is built in the UI for richer template handling; only the working form was created. Clone in the UI if needed for the live demo.")
         if "workflow" in where.lower() and "Workflow build" not in " ".join(limits):
             limits.append("Workflow build is faster in the UI for this routing logic; affected workflows are built manually (60 seconds each).")
+        if "reports" in where.lower() and "Reporting dashboards" not in " ".join(limits):
+            limits.append("Reporting dashboards are planned in the build plan but need the Playwright report-builder phase or a manual UI pass before the live demo.")
     return limits[:6]
 
 
@@ -1342,7 +1790,7 @@ def _research_sources(research: dict) -> list[tuple[str, str]]:
 
 def generate_docx(manifest: dict, research: dict, plan: dict, *,
                   slug: str, work_dir: str, portal: str) -> str:
-    """Build the demo runbook .docx. Returns the path to the saved .docx."""
+    """Build the demo/showcase runbook .docx. Returns the path to the saved .docx."""
     doc = _build_doc(manifest, research, plan, slug=slug, work_dir=work_dir, portal=portal)
     out_path = os.path.join(work_dir, "demo-doc.docx")
     doc.save(out_path)

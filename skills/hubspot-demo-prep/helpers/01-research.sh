@@ -60,12 +60,15 @@ LOGO_OUT="$WORK/logo.png"
 cat > "$WORK/playwright-script.js" <<EOF
 const { chromium } = require('playwright');
 (async () => {
+  const url = process.env.DEMO_PREP_URL;
+  const screenshotPath = process.env.DEMO_PREP_SCREENSHOT;
+  const domDumpPath = process.env.DEMO_PREP_DOM_DUMP;
   const browser = await chromium.launch();
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await ctx.newPage();
   try {
-    await page.goto('$URL', { timeout: 30000, waitUntil: 'networkidle' });
-    await page.screenshot({ path: '$SCREENSHOT', fullPage: false });
+    await page.goto(url, { timeout: 30000, waitUntil: 'networkidle' });
+    await page.screenshot({ path: screenshotPath, fullPage: false });
 
     const data = await page.evaluate(() => {
       const fav = document.querySelector('link[rel="icon"], link[rel="shortcut icon"]')?.href;
@@ -94,11 +97,11 @@ const { chromium } = require('playwright');
         firstParagraphs: Array.from(document.querySelectorAll('p')).slice(0, 3).map(p => p.innerText.trim()).filter(t => t.length > 20)
       };
     });
-    require('fs').writeFileSync('$DOM_DUMP', JSON.stringify(data, null, 2));
+    require('fs').writeFileSync(domDumpPath, JSON.stringify(data, null, 2));
     console.log('OK');
   } catch (e) {
     console.error('Playwright failed:', e.message);
-    require('fs').writeFileSync('$DOM_DUMP', JSON.stringify({ error: e.message }));
+    require('fs').writeFileSync(domDumpPath, JSON.stringify({ error: e.message }));
   }
   await browser.close();
 })();
@@ -116,8 +119,9 @@ else
 fi
 
 PLAYWRIGHT_PID=""
-if (cd /tmp && npx playwright --version >/dev/null 2>&1); then
-  ( node "$WORK/playwright-script.js" > "$WORK/playwright.log" 2>&1 ) &
+if node -e "require.resolve('playwright')" >/dev/null 2>&1; then
+  ( DEMO_PREP_URL="$URL" DEMO_PREP_SCREENSHOT="$SCREENSHOT" DEMO_PREP_DOM_DUMP="$DOM_DUMP" \
+      node "$WORK/playwright-script.js" > "$WORK/playwright.log" 2>&1 ) &
   PLAYWRIGHT_PID=$!
 else
   warn "  Playwright not available, skipping screenshot"
@@ -245,14 +249,20 @@ fi
 # ---- Consolidate ----
 info "Consolidating research..."
 
-python3 - <<PYEOF
+export DEMO_PREP_WORK="$WORK"
+export DEMO_PREP_SLUG="$SLUG"
+export DEMO_PREP_URL="$URL"
+export DEMO_PREP_DOMAIN="$DOMAIN"
+export DEMO_PREP_CONTEXT="$CONTEXT"
+
+python3 - <<'PYEOF'
 import json, os, re
 
-work = "$WORK"
-slug = "$SLUG"
-url = "$URL"
-domain = "$DOMAIN"
-context = """$CONTEXT"""
+work = os.environ["DEMO_PREP_WORK"]
+slug = os.environ["DEMO_PREP_SLUG"]
+url = os.environ["DEMO_PREP_URL"]
+domain = os.environ["DEMO_PREP_DOMAIN"]
+context = os.environ.get("DEMO_PREP_CONTEXT", "")
 
 # Firecrawl
 firecrawl = {}

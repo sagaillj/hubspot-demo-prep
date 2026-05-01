@@ -8,6 +8,41 @@ This document is the single source of truth for the plan-schema extension that s
 {
   // ... existing fields ...
 
+  // NEW — run mode. Missing mode defaults to "demo" for v0.3.x compatibility.
+  // Demo mode is prospect/customer-specific. Feature Showcase mode is for
+  // content, enablement, or training stories around one or more HubSpot
+  // features using realistic dummy data.
+  "mode": "demo|feature_showcase",
+
+  // NEW — required when mode == "feature_showcase".
+  // This block preserves the user's story/brain dump so the doc can read as
+  // a feature runbook instead of a prospect-facing sales demo.
+  "feature_showcase": {
+    "story": "We need to show campaign attribution with first touch vs last touch...",
+    "requested_features": [
+      "Campaign attribution",
+      "Deals associated to campaigns",
+      "Revenue reporting by campaign"
+    ],
+    "audience": "Content audience / enablement / Friday stakeholder meeting",
+    "success_criteria": [
+      "Viewer can see how different campaigns influenced the same deal",
+      "Revenue by campaign rolls up without fake-looking uniform data"
+    ],
+    "shot_list": [
+      "Open Jamie Rivera contact timeline and show first campaign touch",
+      "Open Growth Ops Renewal deal and show campaign influence fields",
+      "Open VP Marketing attribution dashboard"
+    ],
+    "artifact_goals": [
+      "Contacts with varied source paths",
+      "Deals with realistic revenue",
+      "Campaign-linked email/form assets",
+      "Attribution dashboard plan"
+    ],
+    "easter_egg_strategy": "Add a source-quality cleanup view that explains why attribution data is trusted."
+  },
+
   // Deal pipeline definition (consumed by builder Phase 4).
   // Each stage MUST be an object with `label` (string) and `probability`
   // (float 0.0-1.0). Bare-string stages will crash builder.py — Phase 4
@@ -224,6 +259,8 @@ This document is the single source of truth for the plan-schema extension that s
 
 | Field | Fallback |
 |-------|----------|
+| `mode` | `"demo"` |
+| `feature_showcase` | `{}`; doc_generator falls back to demo wording unless `mode == "feature_showcase"` |
 | `branding.secondary_color` | `"#1A1A1A"` (near-black, brand-neutral) |
 | `branding.accent_color` | `"#3B82F6"` (slate blue) |
 | `branding.logo_path` | Read from `research.branding.logo_path` (Playwright capture). If still absent, builder skips the logo strip (no broken image). |

@@ -1,14 +1,17 @@
 {
   "name": "hubspot-demo-prep",
-  "description": "HubSpot demo environment generator \u2014 tailor a sandbox to any prospect in minutes",
+  "description": "HubSpot sandbox generator \u2014 tailor prospect demos or feature showcases in minutes",
+  "metadata": {
+    "description": "HubSpot sandbox generator for prospect demos and feature showcases."
+  },
   "owner": {
     "name": "Jeremy Sagaille"
   },
   "plugins": [
     {
       "name": "hubspot-demo-prep",
-      "description": "Generate a tailored, live-feeling HubSpot demo environment for a specific customer. Includes the /hotdog slash command and full skill workflow.",
-      "version": "0.2.0",
+      "description": "Generate tailored HubSpot demo and feature-showcase sandboxes. Includes the /hotdog slash command and full skill workflow.",
+      "version": "0.4.0",
       "source": "./",
       "author": {
         "name": "Jeremy Sagaille"

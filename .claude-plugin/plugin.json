@@ -1,7 +1,7 @@
 {
   "name": "hubspot-demo-prep",
-  "description": "Generate a tailored, live-feeling HubSpot demo environment for a specific customer in minutes. Researches the prospect, builds an ICP-realistic CRM dataset, generates branded marketing assets, configures workflows, and produces a polished demo runbook.",
-  "version": "0.3.1",
+  "description": "Generate a tailored, live-feeling HubSpot sandbox in Demo mode or Feature Showcase mode. Builds prospect demos, feature-showcase dummy data, branded assets, campaign attribution stories, and polished Google Doc runbooks.",
+  "version": "0.4.0",
   "author": {
     "name": "Jeremy Sagaille"
   },
@@ -13,6 +13,8 @@
     "demo",
     "crm",
     "sales-engineering",
-    "marketing-automation"
+    "marketing-automation",
+    "feature-showcase",
+    "campaign-attribution"
   ]
 }
