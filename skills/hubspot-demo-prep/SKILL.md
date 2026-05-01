@@ -1,6 +1,6 @@
 ---
 name: hubspot-demo-prep
-description: Generate a tailored, "live"-feeling HubSpot sandbox in minutes in either Demo mode or Feature Showcase mode. Demo mode researches a prospect and builds customer-specific CRM data, workflows, forms, marketing assets, reports, and a Google Doc runbook. Feature Showcase mode starts from a user's story / brain dump about one or more HubSpot features, then builds screenshot-ready data and artifacts that prove that feature story, with a Google Doc linking to everything built plus an adjacent-value Easter egg. Triggers on "prep a demo for X", "demo prep", "feature showcase", "showcase HubSpot attribution", "build dummy data for HubSpot", "build me a demo for [company]", "tailor a HubSpot demo", "demo for [company URL]", "set up a customer demo", or any request to create custom-tailored HubSpot demo data or feature-showcase data.
+description: Generate a tailored, "live"-feeling HubSpot sandbox in minutes in either Demo mode or Feature Showcase mode. Demo mode researches a prospect and builds customer-specific CRM data, workflows, forms, marketing assets, reports, and a Google Doc runbook. Feature Showcase mode starts from a user's story / brain dump about one or more HubSpot features, then builds screenshot-ready data and artifacts that prove that feature story, optionally using a LinkedIn-safe fictional customer, with a Google Doc linking to everything built plus an adjacent-value Easter egg. Triggers on "prep a demo for X", "demo prep", "feature showcase", "showcase HubSpot attribution", "build dummy data for HubSpot", "fictional customer demo data", "LinkedIn-safe HubSpot demo", "build me a demo for [company]", "tailor a HubSpot demo", "demo for [company URL]", "set up a customer demo", or any request to create custom-tailored HubSpot demo data or feature-showcase data.
 user-invokable: true
 argument-hint: "[demo|showcase] [company-url-or-name OR feature story] [optional context: pain points, agenda, transcript path]"
 ---
@@ -10,20 +10,21 @@ argument-hint: "[demo|showcase] [company-url-or-name OR feature story] [optional
 Build a tailored HubSpot sandbox through one of two paths:
 
 1. **Demo mode** — build a customer-specific demo environment for a prospect. Solve for the customer.
-2. **Feature Showcase mode** — build a screenshot-ready or recording-ready environment that proves a HubSpot feature story with realistic dummy data. Solve for the audience's "can HubSpot really do this?" moment.
+2. **Feature Showcase mode** — build a screenshot-ready or recording-ready environment that proves a HubSpot feature story with realistic dummy data. Can use a real brand for private enablement or a fictional, public-safe customer for LinkedIn/content. Solve for the audience's "can HubSpot really do this?" moment.
 
 ## When to use
 
 - Prepping for a sales call where you want demo data that mirrors the prospect's industry / ICP / pain
 - Recording a demo for a specific company and need it to feel real
 - Creating content, enablement, or training assets around one or more HubSpot features
+- Creating public screenshots or LinkedIn content where real customer data, logos, and names should not appear
 - Showing a new feature with realistic dummy data, e.g. campaign attribution, journeys, custom events, reporting, scoring, workflows, forms, or associations
 - Creating a sales-engineering practice environment
 - Demonstrating HubSpot capabilities to someone outside your typical demo flow
 
 ## Inputs
 
-First, determine the run mode. If the user does not make the mode clear, ask one concise question: **"Is this Demo mode for a prospect, or Feature Showcase mode for a feature/content story?"**
+First, determine the run mode. If the user does not make the mode clear, ask one concise question: **"Is this Demo mode for a real prospect, or Feature Showcase mode for a real or fictional feature/content story?"**
 
 ### Demo mode inputs
 
@@ -35,16 +36,17 @@ First, determine the run mode. If the user does not make the mode clear, ask one
 ### Feature Showcase mode inputs
 
 1. **Feature story / brain dump** (required) — ask for the user's explanation of what they are trying to show. Encourage messiness: Slack messages, bullets, "I need to show first touch vs last touch," screenshots, known objections, report examples, workflow notes. More is better.
-2. **Requested feature(s)** (required) — one or more HubSpot features or outcomes. Examples: campaign attribution, custom events, journey analytics, deal-to-campaign reporting, lead scoring, workflow automation, forms + submissions, reporting dashboards.
-3. **Audience and output context** (recommended) — content audience, enablement audience, customer type, recording/demo setting, what the audience should believe by the end.
-4. **Optional company or brand URL** — use only for visual branding and vocabulary. If absent, create a neutral showcase company whose name reflects the story, e.g. "Campaign Attribution Showcase."
-5. **Optional folder of context** — path to local or Drive materials. Skill ingests as story input.
+2. **Customer basis / content safety** (required) — ask whether this should use a real prospect/brand, a real brand for styling only, or an invented fictional customer. If the output may be posted publicly, default to a fictional customer and set `feature_showcase.public_safe: true`.
+3. **Requested feature(s)** (required) — one or more HubSpot features or outcomes. Examples: campaign attribution, custom events, journey analytics, deal-to-campaign reporting, lead scoring, workflow automation, forms + submissions, reporting dashboards.
+4. **Audience and output context** (recommended) — content audience, enablement audience, customer type, recording/demo setting, what the audience should believe by the end.
+5. **Optional company or brand URL** — use only when the user wants private enablement or styling from a real brand. If absent, or if the user requests public-safe content, create a fictional showcase company whose industry, offer, personas, and data model reflect the story.
+6. **Optional folder of context** — path to local or Drive materials. Skill ingests as story input.
 
 ## North star
 
 In Demo mode, HubSpot's motto applies directly: **"solve for the customer."** Every choice — agenda, Easter egg, build prioritization, copy in branded assets — is judged against: *does this make the customer's business better?* Not: *does this show off HubSpot?*
 
-In Feature Showcase mode, the goal is different: **prove the feature story with credible, audience-ready data.** Every choice is judged against: *does this make the feature obvious, believable, and easy to record or demo?* Not: *did we create the maximum number of objects?*
+In Feature Showcase mode, the goal is different: **prove the feature story with credible, audience-ready data.** Every choice is judged against: *does this make the feature obvious, believable, and easy to record or demo?* Not: *did we create the maximum number of objects?* When `public_safe` is true, the additional standard is: *could Jordan screenshot this without exposing a real customer, logo, person, or private detail?*
 
 ## Phases
 
@@ -80,14 +82,16 @@ Outputs to `/tmp/demo-prep-<slug>/research.json`:
 - `pain_points_inferred`: bulleted list from research, citing source
 - `industry_stats`: array of `{stat, citation_url}`, only stats relevant to the agenda
 
-**Feature Showcase mode:** if the user supplied a URL, run the same research workflow for branding and vocabulary. If no URL was supplied, synthesize `/tmp/demo-prep-<slug>/research.json` from the story:
+**Feature Showcase mode:** if the user supplied a URL and wants a real brand/private enablement, run the same research workflow for branding and vocabulary. If no URL was supplied, or if the user requests a fictional/public-safe customer, synthesize `/tmp/demo-prep-<slug>/research.json` from the story:
 
 - `mode`: `"feature_showcase"`
-- `company`: neutral showcase company name, industry, and GTM model inferred from the feature story
-- `branding`: neutral but polished defaults unless a brand URL provided colors/logo
+- `company`: fictional showcase company name, reserved-safe domain under `.example.com`, industry, GTM model, personas, and offer inferred from the feature story
+- `branding`: neutral but polished defaults unless a real brand URL is explicitly allowed for private use
 - `stated_context`: the user's raw brain dump or concise summary
-- `feature_showcase`: requested features, audience, story, success criteria, and shot-list hints
+- `feature_showcase`: requested features, audience, story, success criteria, shot-list hints, `customer_basis`, `public_safe`, and `fictional_company_brief` when applicable
 - `sources`: optional user-provided links/files; do not invent citations
+
+For public-safe fictional runs, never research or mimic a real customer's logo, name, employees, domain, or private data. Use plausible synthetic people, companies, emails, and deal names. Keep all invented email/domain values on reserved domains such as `.example.com`.
 
 ### Phase 2: Synthesize the plan
 
@@ -104,6 +108,7 @@ Write `plan["mode"]` as `"demo"` or `"feature_showcase"` on every new plan. Omit
      - Generate a 3-5 step `agenda` that reads as a showcase flow, not a sales-call agenda.
      - Every item must map to at least one requested feature and one artifact the builder will create or a manual step the doc will honestly surface.
      - Prefer story labels like "Show first touch vs last touch," "Open the campaign-attributed deal," "Compare revenue by campaign," or "Trigger the association workflow" over generic feature names.
+     - If `feature_showcase.public_safe` is true, phrase the flow for recording/content and keep customer language fictional but specific.
 
 2. **Easter egg / adjacent-value selection:**
    - **Demo mode:** Use `references/easter-egg-catalog.md`. Filter to items that match the customer's ICP signals; exclude anything already on the agenda; pick by `customer_value` score. If a sales-heavy / no-marketing-team / lead-flow signal is present, lead scoring is almost always the right call.
@@ -116,12 +121,12 @@ Write `plan["mode"]` as `"demo"` or `"feature_showcase"` on every new plan. Omit
    - Conditional (only if relevant to agenda or Easter egg): custom object, custom event, marketing email, landing page, NPS form, lead scoring, additional workflows.
    - Quotes / invoices: only if explicitly relevant.
    - **Reports + dashboards (v0.4, conditional on digital-funnel signal):** see step 5b below.
-   - **Feature Showcase mode:** Build only what supports the requested feature story, but make the data deep enough to record. For report/attribution stories, this usually means 30+ contacts, 3+ campaigns or source buckets, multiple deals with real amounts, and named sample records that the doc's shot list can link to.
+   - **Feature Showcase mode:** Build only what supports the requested feature story, but make the data deep enough to record. For report/attribution stories, this usually means 30+ contacts, 3+ campaigns or source buckets, multiple deals with real amounts, and named sample records that the doc's shot list can link to. If `public_safe` is true, every named record must be fictional, screenshot-safe, and disconnected from real customer identities.
 
 5. **Plan content fields (v0.3.0 base + v0.4 extensions).** Authoritative base schema: `docs/punch-lists/2026-04-26-post-test-tweaks/plan-schema.md`. v0.4 adds reports/funnel fields in `docs/punch-lists/2026-04-28-reports-and-dashboards/plan-schema-v0.4.md`. Every consumer (`builder.py`, `doc_generator.py`, `playwright_phases_extras.py`) has a safe industry-neutral fallback if a field is missing — but the output only feels real if Phase 2 populates these with the prospect's or showcase story's vocabulary, not Shipperz's, not Boomer's, not the previous run's. Generate every field below using the prospect's industry, services, brand voice, or the feature-showcase story as the source of truth:
 
    - **`mode`** — `"demo"` or `"feature_showcase"`. Defaults to `"demo"` when missing.
-   - **`feature_showcase`** (required when `mode == "feature_showcase"`) — `{story, requested_features, audience, success_criteria, shot_list, artifact_goals, easter_egg_strategy}`. This block drives doc language, showcase flow, and the quality gate.
+   - **`feature_showcase`** (required when `mode == "feature_showcase"`) — `{story, requested_features, audience, success_criteria, shot_list, artifact_goals, easter_egg_strategy, customer_basis, public_safe, fictional_company_brief}`. This block drives doc language, showcase flow, content-safety rules, and the quality gate. Use `customer_basis: "fictional"` and `public_safe: true` for LinkedIn/content runs.
 
    - **`branding`** — `primary_color`, `secondary_color`, `accent_color`, `neutral_dark`, `neutral_light` (hex). Pull from research.json branding; do NOT default to `#FF6B35` (transport orange). The doc + email + form theme all read from this.
    - **`property_group`** — `name` (e.g. `f"{slug}_demo_properties"`) and `label` (e.g. `f"Demo ({company_name})"`). Visible in HubSpot property admin; must not say "Shipperz Demo" for non-Shipperz prospects.
@@ -133,7 +138,7 @@ Write `plan["mode"]` as `"demo"` or `"feature_showcase"` on every new plan. Omit
    - **`forms[].theme`** — `submit_button_color` (defaults to `branding.primary_color`) and `submit_text_color`. For the NPS form, also include `forms[].test_submission_data`: `first_names`, `last_names`, `score_distribution`, `feedback_pool`. Use names + feedback that fit the prospect's customer base.
 
      **NPS field type — ALWAYS use `radio` with 10 options 1-10 (Fix E1, 2026-04-26).** The `number` field type forces free-text "type a 1-10" entry, which looks unprofessional and breaks the standard NPS UX pattern. Use `field_type: "radio"` for the score field. builder.py auto-populates the 10-option ladder when `options` is omitted on a radio field named `nps_score` (or any radio with `min:1, max:10`), so the plan can stay terse. NPS question wording: prefer the canonical Reichheld phrasing — *"On a scale of 1 to 10, how likely are you to recommend {company} to a friend or colleague?"* — over *"would you recommend...?"*. Optional follow-up: *"What's the primary reason for your score?"* instead of generic "Tell us about your experience".
-   - **`recommendation_text`** — the doc's "how to lead the demo" paragraph. Generate prospect-specific copy that references real plan values (sample contact name, agenda items, custom object name). **Critical:** any dollar amount you cite MUST exist as a deal in the manifest. Otherwise omit the dollar amount. (See Quality Gate item 6 — phantom numbers killed the Boomer demo with a "$4,200 boat install" that never existed.)
+   - **`recommendation_text`** — the doc's "how to lead the demo" paragraph. Generate prospect-specific or showcase-specific copy that references real plan values (sample contact name, agenda items, custom object name). **Critical:** any dollar amount you cite MUST exist as a deal in the manifest. Otherwise omit the dollar amount. (See the Quality Gate's "No phantom numbers" check — phantom numbers killed the Boomer demo with a "$4,200 boat install" that never existed.)
    - **`playwright_dashboard`** — `name` (e.g. `f"{company_name} Daily Snapshot"`), `filter_pipeline_name` (matches the actual pipeline name in this plan), `filter_stages` (prospect-specific stage names). Required when `--playwright` is used; otherwise the dashboard inherits leftover Shipperz naming.
    - **`doc_replacement_id`** (optional) — Google Doc template ID override; replaces the legacy `if self.slug == "shipperzinc"` branching. Leave unset for default behavior.
 
@@ -184,18 +189,19 @@ Write `plan["mode"]` as `"demo"` or `"feature_showcase"` on every new plan. Omit
 7. **Phase 2 Quality Gate — must pass before invoking `builder.py`.** Before writing the final `build-plan.json`, run these checks mentally on the plan you just generated. If any check fails, fix the plan before continuing. The cost of failing here is a prospect or content audience noticing a "wait, this isn't real" detail — which kills the demo or recording.
 
    1. **Mode is explicit.** New plans set `mode`. Demo plans include a real company identifier. Feature Showcase plans include `feature_showcase.story` and at least one requested feature.
-   2. **No terminology reuse from prior runs.** No phrasing carried over from a previous prospect. Search the plan you wrote for any of: `"shipment"`, `"snowbird"`, `"transport"`, `"vehicle"`, `"route"`, `"Tesla"`, `"marine"`, `"boat"`, `"audio"`, `"install"`, `"HVAC"`, `"furnace"` and confirm each instance is genuinely correct for THIS prospect/story — not an artifact of a prior run's leakage.
-   3. **Persona freshness.** Re-infer contact personas from this prospect's `research.json` + industry + GTM model, or from the showcase audience/story. Don't reuse personas from any previous run.
-   4. **Deal-stage specificity.** Pipeline stages reflect the prospect's actual sales cycle or the feature story's reporting need (e.g. SaaS: "Demo Scheduled / Proposal / Negotiation / Closed-won"; agency: "Discovery / Scope / Signed / Kickoff"; attribution showcase: "Campaign Influenced / SQL / Opportunity / Closed-won").
-   5. **Custom object naming.** Object name reflects the prospect domain or feature story (`campaign_touchpoint` for an attribution showcase, not `shipment` for a campaign report).
-   6. **Email voice-match.** Marketing email CTA style matches the prospect's website CTA pattern or the showcase story's asset being demonstrated.
-   7. **No phantom numbers.** Any dollar amount cited in `recommendation_text` or any narrative field must correspond to an actual deal amount in the plan. (Recall the Boomer "$4,200 boat install" bug.)
-   8. **Logo persistence (Fix F, 2026-04-26).** Confirm `plan["branding"]["logo_path"]` is set AND the file exists on disk when a brand URL was researched. If no brand URL exists in Feature Showcase mode, use intentional neutral branding and do not cite a missing logo path.
-   9. **NPS form uses `radio` not `number` (Fix E1, 2026-04-26).** Any form whose name contains "NPS" or whose fields include `nps_score` MUST declare the score field as `field_type: "radio"`. The 1-10 options ladder is auto-populated by builder.py if omitted. Question wording follows the canonical Reichheld NPS prompt: *"On a scale of 1 to 10, how likely are you to recommend {company} to a friend or colleague?"*
-   10. **Feature Showcase coverage.** When `mode == "feature_showcase"`, every requested feature must have at least one built artifact, planned report, or explicit manual step in the doc. Sample records named in the shot list must exist in `contacts`, `deals`, `campaign_attribution_showcase`, or manifest-linked assets.
-   11. **Campaign attribution coherence.** When showing attribution, include multiple campaigns/source paths, first-touch and last-touch differences, contact-to-deal linkage, deal amounts that sum cleanly in reports, and a workflow/manual step for propagating campaign influence to deals if the public API cannot build that association directly.
-   12. **Funnel-data realism (v0.4, when `custom_event_flows` is present).** For each flow: `firing_strategy.drop_off_rates` length equals `events.length - 1`; every value is between 0 and 1; values vary step-by-step (not a flat 0.6 across every step — produces a single-line Sankey); cumulative survivors do not collapse to 0 before the final step unless the flow intentionally models total abandonment; `contact_count` ≥ 20 (Sankey looks broken below 20); `date_range_days` ≥ 30 (gives the line chart room to show momentum).
-   13. **Reports / events alignment (v0.4, when `playwright_reports` is present).** Every report whose `data_source: "custom_events"` references events that actually exist in some `custom_event_flows[].events[].name` (no orphan references). Every dashboard with a `tier_required: "marketing_enterprise"` report has a tier-degradation alternative noted in case the sandbox is downgraded. Each dashboard uses ≥ 4 distinct `viz_type` values (no all-bar dashboards). Each dashboard has ≤ 12 reports. Dashboard names follow audience-plus-outcome pattern (not "Sales Dashboard").
+   2. **Public-safe fictional runs are actually public-safe.** When `mode == "feature_showcase"` and `feature_showcase.public_safe` is true, set `feature_showcase.customer_basis: "fictional"` unless the user explicitly requested otherwise; use fictional company/person/deal names; use `.example.com` or another reserved/safe domain for invented emails and URLs; do not use real customer logos, employee names, private screenshots, or copied customer data; make the doc visibly state that the scenario is fictional and safe for public screenshots.
+   3. **No terminology reuse from prior runs.** No phrasing carried over from a previous prospect. Search the plan you wrote for any of: `"shipment"`, `"snowbird"`, `"transport"`, `"vehicle"`, `"route"`, `"Tesla"`, `"marine"`, `"boat"`, `"audio"`, `"install"`, `"HVAC"`, `"furnace"` and confirm each instance is genuinely correct for THIS prospect/story — not an artifact of a prior run's leakage.
+   4. **Persona freshness.** Re-infer contact personas from this prospect's `research.json` + industry + GTM model, or from the showcase audience/story. Don't reuse personas from any previous run.
+   5. **Deal-stage specificity.** Pipeline stages reflect the prospect's actual sales cycle or the feature story's reporting need (e.g. SaaS: "Demo Scheduled / Proposal / Negotiation / Closed-won"; agency: "Discovery / Scope / Signed / Kickoff"; attribution showcase: "Campaign Influenced / SQL / Opportunity / Closed-won").
+   6. **Custom object naming.** Object name reflects the prospect domain or feature story (`campaign_touchpoint` for an attribution showcase, not `shipment` for a campaign report).
+   7. **Email voice-match.** Marketing email CTA style matches the prospect's website CTA pattern or the showcase story's asset being demonstrated.
+   8. **No phantom numbers.** Any dollar amount cited in `recommendation_text` or any narrative field must correspond to an actual deal amount in the plan. (Recall the Boomer "$4,200 boat install" bug.)
+   9. **Logo persistence (Fix F, 2026-04-26).** Confirm `plan["branding"]["logo_path"]` is set AND the file exists on disk when a brand URL was researched. If no brand URL exists in Feature Showcase mode, use intentional neutral branding and do not cite a missing logo path.
+   10. **NPS form uses `radio` not `number` (Fix E1, 2026-04-26).** Any form whose name contains "NPS" or whose fields include `nps_score` MUST declare the score field as `field_type: "radio"`. The 1-10 options ladder is auto-populated by builder.py if omitted. Question wording follows the canonical Reichheld NPS prompt: *"On a scale of 1 to 10, how likely are you to recommend {company} to a friend or colleague?"*
+   11. **Feature Showcase coverage.** When `mode == "feature_showcase"`, every requested feature must have at least one built artifact, planned report, or explicit manual step in the doc. Sample records named in the shot list must exist in `contacts`, `deals`, `campaign_attribution_showcase`, or manifest-linked assets.
+   12. **Campaign attribution coherence.** When showing attribution, include multiple campaigns/source paths, first-touch and last-touch differences, contact-to-deal linkage, deal amounts that sum cleanly in reports, and a workflow/manual step for propagating campaign influence to deals if the public API cannot build that association directly.
+   13. **Funnel-data realism (v0.4, when `custom_event_flows` is present).** For each flow: `firing_strategy.drop_off_rates` length equals `events.length - 1`; every value is between 0 and 1; values vary step-by-step (not a flat 0.6 across every step — produces a single-line Sankey); cumulative survivors do not collapse to 0 before the final step unless the flow intentionally models total abandonment; `contact_count` ≥ 20 (Sankey looks broken below 20); `date_range_days` ≥ 30 (gives the line chart room to show momentum).
+   14. **Reports / events alignment (v0.4, when `playwright_reports` is present).** Every report whose `data_source: "custom_events"` references events that actually exist in some `custom_event_flows[].events[].name` (no orphan references). Every dashboard with a `tier_required: "marketing_enterprise"` report has a tier-degradation alternative noted in case the sandbox is downgraded. Each dashboard uses ≥ 4 distinct `viz_type` values (no all-bar dashboards). Each dashboard has ≤ 12 reports. Dashboard names follow audience-plus-outcome pattern (not "Sales Dashboard").
 
    If any check fails, fix the plan before continuing. The cost of failing here is someone noticing a "wait, this isn't really for me" detail — which kills the demo, showcase, or recording.
 

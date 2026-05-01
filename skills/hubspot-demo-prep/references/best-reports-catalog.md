@@ -4,6 +4,8 @@ Used by Phase 2 to plan industry-appropriate reports and dashboards. Each entry 
 
 The single most important standard: every dashboard the skill builds must look like a designer made it. Top 10% lens. If a Sankey shows 3 contacts in a single straight line because we only fired full-path events, the demo defeats itself.
 
+For Feature Showcase runs intended for LinkedIn, training, or public screenshots, make the report story fictional but specific: invented company, invented campaigns, invented contacts/deals, and reserved-safe domains such as `.example.com`. Do not borrow a real customer's name or logo just because the motivating example came from a real Slack thread.
+
 ## Selection algorithm
 
 1. Filter the catalog for bundles whose `applies_to` matches the prospect's ICP signals (industry, GTM model, business size, stated pain).

@@ -11,14 +11,26 @@ This document is the single source of truth for the plan-schema extension that s
   // NEW — run mode. Missing mode defaults to "demo" for v0.3.x compatibility.
   // Demo mode is prospect/customer-specific. Feature Showcase mode is for
   // content, enablement, or training stories around one or more HubSpot
-  // features using realistic dummy data.
+  // features using realistic dummy data; it can be public-safe with an
+  // invented fictional customer.
   "mode": "demo|feature_showcase",
 
   // NEW — required when mode == "feature_showcase".
   // This block preserves the user's story/brain dump so the doc can read as
-  // a feature runbook instead of a prospect-facing sales demo.
+  // a feature runbook instead of a prospect-facing sales demo. When
+  // `public_safe` is true, all customer/person/company/domain details must be
+  // fictional or reserved-safe for screenshots and public content.
   "feature_showcase": {
     "story": "We need to show campaign attribution with first touch vs last touch...",
+    "customer_basis": "fictional",     // fictional | real_brand_optional | prospect
+    "public_safe": true,               // true for LinkedIn/social/training screenshots
+    "fictional_company_brief": {
+      "name": "Northstar Growth Labs",
+      "domain": "northstar-growth.example.com",
+      "industry": "B2B SaaS",
+      "offer": "Revenue operations software for mid-market teams",
+      "why_this_fit": "A marketing-led funnel makes campaign attribution visible without using a real customer's data."
+    },
     "requested_features": [
       "Campaign attribution",
       "Deals associated to campaigns",
@@ -261,6 +273,9 @@ This document is the single source of truth for the plan-schema extension that s
 |-------|----------|
 | `mode` | `"demo"` |
 | `feature_showcase` | `{}`; doc_generator falls back to demo wording unless `mode == "feature_showcase"` |
+| `feature_showcase.customer_basis` | `"fictional"` when `public_safe` is true, otherwise `"real_brand_optional"` |
+| `feature_showcase.public_safe` | `false`; orchestrator should set `true` whenever the user mentions LinkedIn, public screenshots, social content, training examples, or avoiding customer data |
+| `feature_showcase.fictional_company_brief` | If `public_safe` is true and absent, derive from `research.company` / `plan.company`; use `.example.com` for invented domains |
 | `branding.secondary_color` | `"#1A1A1A"` (near-black, brand-neutral) |
 | `branding.accent_color` | `"#3B82F6"` (slate blue) |
 | `branding.logo_path` | Read from `research.branding.logo_path` (Playwright capture). If still absent, builder skips the logo strip (no broken image). |

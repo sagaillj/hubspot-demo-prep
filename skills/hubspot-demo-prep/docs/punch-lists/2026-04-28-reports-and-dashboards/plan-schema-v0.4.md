@@ -146,6 +146,11 @@ Every consumer must continue to implement industry-neutral fallbacks per v0.3.0'
   // custom events, reports_status/manual steps, and doc links. If a requested
   // campaign/deal association is UI-only or unavailable in the public API, the
   // builder/doc must surface a manual_step rather than pretending it is built.
+  //
+  // For public-safe Feature Showcase runs, pair this with
+  // `feature_showcase.public_safe: true` and use fictional contacts, deals,
+  // campaigns, domains, and company names. Do not use real customer data just
+  // because the story came from a real Slack/customer example.
   "campaign_attribution_showcase": {
     "story": "Show how deals can be reported by campaign after campaign influence is associated to deals.",
     "campaigns": [

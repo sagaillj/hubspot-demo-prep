@@ -1508,6 +1508,24 @@ def _render_checklist(doc, *, manifest: dict, urls: dict, portal: str) -> None:
 def _render_feature_showcase_brief(doc, *, feature: dict, company: dict, research: dict) -> None:
     """Render the story/feature brief for Feature Showcase mode."""
     rows: list[tuple[str, str]] = []
+    customer_basis = feature.get("customer_basis") or feature.get("customer_type")
+    public_safe = bool(feature.get("public_safe"))
+    fictional_brief = feature.get("fictional_company_brief") or {}
+
+    if public_safe:
+        rows.append(("Public-safe", "Fictional customer and synthetic data; safe for LinkedIn, training, and screenshots."))
+    elif customer_basis:
+        rows.append(("Customer basis", str(customer_basis).replace("_", " ").title()))
+
+    if isinstance(fictional_brief, dict) and fictional_brief:
+        brief_parts = []
+        for key in ("name", "industry", "offer", "domain"):
+            value = fictional_brief.get(key)
+            if value:
+                brief_parts.append(str(value))
+        if brief_parts:
+            rows.append(("Fictional customer", " | ".join(brief_parts)[:500]))
+
     story = feature.get("story") or research.get("stated_context")
     if story:
         rows.append(("Story", str(story)[:900]))
